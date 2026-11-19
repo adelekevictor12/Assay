@@ -42,6 +42,7 @@ pub struct Safety {
     pub flags: u32,                // mechanic bitset
     pub evidence_hash: BytesN<32>, // sha256 of the evidence bundle
     pub attested_at: u64,          // ledger timestamp
+    pub preimage_version: u32,     // encoding version used to produce evidence_hash
 }
 
 // One element of an attest_many batch: the arguments of attest(), grouped.
@@ -52,11 +53,17 @@ pub struct Attestation {
     pub evidence_hash: BytesN<32>,
 }
 
-/// The largest batch attest_many accepts. The cap is derived from the
-/// live transaction resource limits; see "attest_many" below.
+/// The largest batch attest_many and get_safety_many accept. The cap is
+/// derived from the live transaction resource limits; see "attest_many" below.
 pub const MAX_BATCH_SIZE: u32 = 50;
 
+/// The contract's interface version, bumped on every ABI change. See
+/// "Interface versioning" below for the bump rule.
+pub const INTERFACE_VERSION: u32 = 3;
+
 pub fn get_safety(env: Env, asset: Address) -> Option<Safety>;
+pub fn version(env: Env) -> u32;
+pub fn get_safety_many(env: Env, assets: Vec<Address>) -> Result<Vec<Option<Safety>>, Error>;
 pub fn is_safe(env: Env, asset: Address, max_severity: u32, max_age_secs: u64) -> bool;
 pub fn is_safe_masked(env: Env, asset: Address, forbidden_mask: u32, max_age_secs: u64) -> bool;
 pub fn attest(env: Env, asset: Address, severity: u32, flags: u32, evidence_hash: BytesN<32>) -> Result<(), Error>;
@@ -65,6 +72,9 @@ pub fn revoke(env: Env, asset: Address) -> Result<(), Error>;
 pub fn init(env: Env, admin: Address) -> Result<(), Error>;
 pub fn transfer_admin(env: Env, new_admin: Address) -> Result<(), Error>;
 pub fn accept_admin(env: Env) -> Result<(), Error>;
+pub fn cancel_admin_transfer(env: Env) -> Result<(), Error>;
+pub fn admin(env: Env) -> Option<Address>;
+pub fn pending_admin(env: Env) -> Option<Address>;
 ```
 
 The `Vec<Attestation>` argument is confirmed against the built artifact rather
@@ -73,15 +83,39 @@ than assumed: `stellar contract info interface` on the compiled wasm publishes
 with `Attestation` as a contracttype UDT, so a `Vec` of a `#[contracttype]`
 struct is a supported argument type in soroban-sdk 27.
 
+## Interface versioning
+
+`version()` is a read-only entrypoint that returns the contract's interface
+version (`INTERFACE_VERSION`), currently `3`. A consumer or a drift script can
+call it to ask "what is this contract?" instead of inferring the interface from
+a wasm hash.
+
+### The bump rule
+
+`INTERFACE_VERSION` is bumped by exactly one on every ABI change:
+
+- **Bump:** adding, removing, or renaming an entrypoint; changing an
+  entrypoint's signature; changing the [`Safety`] or [`Attestation`] shapes;
+  changing an error code; changing the event schema.
+- **No bump:** purely additive read-only entrypoints that old consumers can
+  safely ignore (a new `get_safety_many` does not break an existing
+  `get_safety` caller), and documentation-only changes.
+
+Adding `version()` itself establishes version 1: the interface as of that
+build is version 1. Version 2 adds `cancel_admin_transfer` and the
+`cancel_admin` event. The constant is an ABI value and is parsed by the Go ABI
+drift test, so it cannot drift from the deployed interface without a red build.
+
 | Error | Code | Returned by |
 | --- | --- | --- |
 | `AlreadyInitialized` | 1 | `init` on an initialized contract |
-| `NotInitialized` | 2 | `attest`, `attest_many`, `revoke`, `transfer_admin` before `init` |
+| `NotInitialized` | 2 | `attest`, `attest_many`, `revoke`, `transfer_admin`, `cancel_admin_transfer` before `init` |
 | `InvalidSeverity` | 3 | `attest`, `attest_many` with severity above 4 |
 | `InconsistentAttestation` | 4 | `attest`, `attest_many` with the clawback bit below `SEVERITY_HIGH` |
 | `NotAttested` | 5 | `revoke` for an asset with no attestation |
-| `NoPendingAdmin` | 6 | `accept_admin` with no pending transfer |
+| `NoPendingAdmin` | 6 | `accept_admin` or `cancel_admin_transfer` with no pending transfer |
 | `BatchTooLarge` | 7 | `attest_many` with more than `MAX_BATCH_SIZE` elements |
+| `InvalidAsset` | 8 | `attest`, `attest_many` with the registry's own address, the admin's address, or a non-contract address |
 
 ### `attest_many`: many attestations in one transaction
 
@@ -94,8 +128,9 @@ Every element is written exactly as `attest` writes it — the same
 event — and both entrypoints call the same validation function. A batch is
 **not** a lower bar:
 
-- `InvalidSeverity` and `InconsistentAttestation` are the same checks, on every
-  element. There is no batch path around the confiscation invariant.
+- `InvalidAsset`, `InvalidSeverity` and `InconsistentAttestation` are the same
+  checks, on every element. There is no batch path around the address rule or
+  the confiscation invariant.
 - `require_auth` on the admin is required, as for `attest`. An empty batch is
   authorized too: who may call an entrypoint is a property of the entrypoint,
   not of what it was handed.
@@ -134,8 +169,8 @@ the same enforcement the SDK applies in the tests:
 | ledger entries written | 200 | 51 | 26% |
 | transaction footprint entries | 400 | 105 | 26% |
 | bytes written | 132 096 | 14 072 | 11% |
-| instructions | 400 000 000 | 3 275 513 | 0.8% |
-| memory | 41 943 040 | 514 609 | 1.2% |
+| instructions | 400 000 000 | 3 383 545 | 0.8% |
+| memory | 41 943 040 | 544 276 | 1.3% |
 
 Each element publishes its own `Attested` event and one such event is exactly
 200 bytes, so the event budget admits **at most 81 elements** however frugal the
@@ -157,6 +192,41 @@ full batch with the SDK's mainnet resource enforcement switched on (which
 per-event cost so the cap is re-derived rather than silently wrong if the event
 or the write path changes.
 
+#### Per-entrypoint cost baseline
+
+The network limits above are only useful if the common calls stay comfortably
+inside them. [`cost-baseline.json`](../assay-contracts/contracts/safety-registry/cost-baseline.json)
+records the measured cost of each consumer-facing entrypoint, and
+`entrypoint_costs_are_within_the_recorded_baseline` re-measures them and fails
+when CPU instructions, memory, read bytes or write bytes grow by more than 10%
+over the committed value.
+
+| Entrypoint | CPU instructions | Memory (bytes) | Read bytes | Write bytes |
+| --- | --- | --- | --- | --- |
+| `attest` | 58 301 | 8 974 | 0 | 352 |
+| `attest_many(50)` | 3 383 545 | 544 276 | 0 | 14 072 |
+| `get_safety` | 25 417 | 3 524 | 0 | 0 |
+| `is_safe` | 21 409 | 3 148 | 0 | 0 |
+| `is_safe_masked` | 21 855 | 3 148 | 0 | 0 |
+
+The numbers come from the SDK's `env.cost_estimate().resources()` after the
+call in isolation, in the same units the network limits use. Read bytes are
+`disk_read_bytes`; live Soroban entries are served from memory in the test
+host, so that number is zero there even though an entry read still costs
+instructions and a memory-entry read. `is_safe` and `is_safe_masked` write
+nothing, so a gate's cost is paid entirely by the consuming transaction.
+
+Run the check with:
+
+```sh
+cargo test --locked -p assay-safety-registry cost
+```
+
+A change that intentionally moves cost beyond the tolerance updates the
+baseline with `UPDATE_COST_BASELINE=1 cargo test -p assay-safety-registry cost`
+and includes the reason in the same commit. Raising the baseline without a
+reason is exactly the silent regression the check exists to prevent.
+
 #### Empty batches, and one timestamp per batch
 
 An empty batch succeeds and does nothing: no storage write, no event, and no
@@ -170,6 +240,31 @@ when each scan ran, and the elements of one call were written at the same
 instant. If the same asset appears twice in a batch, both are applied in order
 and both events are published, with the second write winning — exactly what two
 calls to `attest` would have done.
+
+### `get_safety_many`: bounded batch read
+
+`get_safety_many(assets)` returns one `Option<Safety>` per asset, in the same
+order the assets were given, for up to [`MAX_BATCH_SIZE`] assets in one call.
+An asset that was never attested, or whose attestation was revoked, reads as
+`None`; a missing asset never fails the whole call.
+
+#### Bound
+
+At most [`MAX_BATCH_SIZE`] assets are accepted; a longer vector returns
+[`Error::BatchTooLarge`] and reads nothing. A batch read larger than the cap is
+an error rather than a truncation on purpose: a caller that asked for N answers
+and got fewer would not know which assets went unread.
+
+The bound mirrors `attest_many`'s so one number governs both directions of the
+batch, and the read cost at the bound is pinned by
+`get_safety_many_cost_at_the_bound`.
+
+#### Never error the whole call because one asset is missing
+
+Within the bound, `get_safety_many` never returns an error: unattested and
+revoked assets read as `None`, and the caller learns per-asset which assets have
+no standing claim. This keeps a consumer that gates several collateral assets
+from failing entirely because one of them was never scanned.
 
 ### `revoke`: withdrawing an attestation
 
@@ -242,6 +337,12 @@ stranger:
   the address recorded by `transfer_admin`). It promotes that address to admin,
   clears the pending entry, and completes the transfer. After this the old
   admin can no longer `attest`, `revoke`, or start another transfer.
+- **`cancel_admin_transfer()`** — authorized by the **current admin**
+  (`require_auth` on the stored admin). It clears the pending entry, leaves the
+  current admin in place, and publishes an `AdminTransferCancelled` event. This
+  is how a proposal to a wrong or compromised address is withdrawn instead of
+  merely overwritten: after cancelling, the old pending address cannot accept,
+  because there is no longer a pending admin.
 
 The errors specific to this path are typed rather than silent:
 
@@ -251,17 +352,27 @@ The errors specific to this path are typed rather than silent:
 | `transfer_admin` | caller is not the current admin | `require_auth` failure; nothing changes |
 | `accept_admin` | no pending transfer | `NoPendingAdmin` (6) |
 | `accept_admin` | caller is not the pending admin | `require_auth` failure; nothing changes |
+| `cancel_admin_transfer` | before `init` | `NotInitialized` (2) |
+| `cancel_admin_transfer` | caller is not the current admin | `require_auth` failure; nothing changes |
+| `cancel_admin_transfer` | no pending transfer | `NoPendingAdmin` (6) |
 
-Neither entrypoint publishes an event, so an admin change is not visible in the
-`attest`/`revoke` event stream; the new admin's first write is the first on-chain
-trace. A transfer moves the admin role only — the stored attestations are
-untouched and `get_safety` keeps serving them across it.
+`transfer_admin` and `accept_admin` do not publish events, so those steps are
+not visible in the `attest`/`revoke` event stream; the new admin's first write
+is the first on-chain trace. `cancel_admin_transfer` publishes one
+`AdminTransferCancelled` event (see "Attestation events" below) so a withdrawn
+handover is observable. A transfer or cancellation moves the admin role only —
+the stored attestations are untouched and `get_safety` keeps serving them.
 
-**The live testnet deployment predates both entrypoints.**
-`CBK4FBIH…` was deployed on 2026-08-15, before `transfer_admin` and
-`accept_admin` existed, and it has no upgrade entrypoint to receive them.
-Calling either against the live contract fails as an unknown entrypoint, and
-rotating the live admin still means a new deployment and re-attestation — see
+The current admin and pending admin can be read at any time without decoding instance storage:
+- **`admin()`** returns `Option<Address>` (`Some(Address)` after `init`, `None` before).
+- **`pending_admin()`** returns `Option<Address>` (`Some(Address)` during an active transfer handshake, `None` otherwise).
+
+**The live testnet deployment predates all five entrypoints.**
+`CBK4FBIH…` was deployed on 2026-08-15, before `transfer_admin`,
+`accept_admin`, `cancel_admin_transfer`, `admin`, and `pending_admin` existed, and it has no upgrade
+entrypoint to receive them. Calling any of them against the live contract fails
+as an unknown entrypoint, and rotating the live admin still means a new deployment
+and re-attestation — see
 [deployment.md](deployment.md#admin-transfer-and-rotation) and
 [attester-key.md](attester-key.md#rotation).
 
@@ -297,6 +408,7 @@ happen.
 | --- | --- | --- |
 | `symbol_short!("attest")` | asset `Address` | `Map<Symbol, Val>` with keys `severity: u32`, `flags: u32`, `attested_at: u64` |
 | `symbol_short!("revoke")` | asset `Address` | `Map<Symbol, Val>` with key `revoked_at: u64` |
+| `Symbol::new(env, "cancel_admin")` | pending admin `Address` | `Map<Symbol, Val>` with key `cancelled_at: u64` |
 
 `attest_many` publishes one such `attest` event per element, in batch order,
 with no batch-specific event or decoding path. A rejected batch publishes
@@ -307,8 +419,13 @@ unauthorized) publishes nothing. The `revoke` event uses the same topic layout
 as `attest`, so an indexer subscribed by asset sees both the write and its
 withdrawal.
 
-The events are defined with the `#[contractevent]` macro on the `Attested` and
-`Revoked` structs
+A successful `cancel_admin_transfer` publishes the third row. A rejected cancel
+(`NoPendingAdmin`, unauthorized) publishes nothing. The pending address is a
+topic so an indexer can filter for the withdrawn proposal without decoding the
+data map.
+
+The events are defined with the `#[contractevent]` macro on the `Attested`,
+`Revoked`, and `AdminTransferCancelled` structs
 in the contract (see `assay-contracts/contracts/safety-registry/src/lib.rs`),
 so the schema is discoverable from the contract spec rather than only from
 this document.
@@ -317,6 +434,14 @@ The asset address is a topic rather than a data-map field so an indexer can
 subscribe by asset without decoding every event body. The topic count is two,
 well within the SDK's four-topic limit, and `Symbol` is the required
 topic-0 shape for a filterable label.
+
+### Event budget impact
+
+Both admin-transfer events carry two addresses and a timestamp. They are
+published once per single (non-batched) admin call, so they do not affect the
+`attest_many` event budget; that cap is measured separately by
+`batch_size_bound_is_measured_and_holds_headroom` and leaves headroom for the
+event schema to grow.
 
 Severity values and mechanic bit positions are **ABI** and mirror
 `internal/mechanics` exactly. Do not renumber them.
@@ -350,6 +475,48 @@ code+issuer string pair. Verified live on Horizon (first recorded 2026-08-11,
 re-checked 2026-09-17): Circle's USDC has a canonical
 `contract_id` of `CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75`.
 `Address` comparison is cheap on-chain; string handling is not.
+
+**Decision (#349): `attest` refuses three kinds of address, and refuses to
+guess past them.** Storage is keyed by any `Address`, so a write aimed at the
+wrong address is fail-closed for the real asset — `get_safety` on the real SAC
+still returns `None` and every gate still refuses — but it is not harmless: it
+pays rent on an entry nobody will read as this asset, publishes an `Attested`
+event naming an address that is not this asset, and leaves an indexer
+something to explain. So the write path returns `InvalidAsset` for:
+
+1. **the registry's own address** — `attest` on the registry would key
+   `Safety(registry)` inside the registry and emit an event reading as the
+   registry attesting itself;
+2. **the admin's address** — the admin is the writer, never the subject. It is
+   normally an account, which rule 3 already covers, but `init` accepts any
+   `Address` and the direct comparison stays correct when the admin is a
+   contract (a multisig, say);
+3. **anything that is not a contract address** — an account (`G…`), a muxed
+   account (`M…`), a claimable balance or a liquidity pool id. A SAC is a
+   contract, so reading the address's type tag rules out the fat-finger case
+   the check exists for: pasting an issuer account where a SAC address belongs.
+
+Each rule costs a comparison or a tag read, with no host invocation. The
+single path and the batch path get all three from the same shared validation
+function, so `attest_many` cannot accept what `attest` refuses;
+`batch_with_an_invalid_asset_address_writes_nothing` pins that a bad address
+in the middle of a batch writes nothing at all.
+
+**What is deliberately not checked is the caller's to own: whether the
+contract at that address really is the SAC for the scanned CODE-ISSUER.**
+Answering it on-chain would mean invoking the candidate contract and trusting
+what it says about itself — neither cheap nor self-authenticating, since an
+impostor answers for itself. The same conclusion is reached off-chain, by
+resolving CODE-ISSUER to its SAC with `stellar contract id asset`, which is
+what `make attest` does before anything is signed. An impostor *contract*
+address therefore passes the on-chain rule, and the attester owns having
+resolved the right one; the stored claim is still what the scanner concluded,
+bound by `evidence_hash`.
+
+This was decided rather than assumed: the checks above are the ones that are
+cheap on-chain, everything else is documented as caller responsibility, and
+the type rule is testable — see `attest_rejects_a_non_contract_address`,
+`attest_rejects_the_registrys_own_address` and `attest_rejects_the_admin_address`.
 
 ### `Option`, so unknown is not safe
 
@@ -440,7 +607,8 @@ otherwise. Distinguishing them would mean storing a marker, which is the
 history/audit question ([#92](https://github.com/use-assay/Assay/issues/92)), not
 revocation.
 
-Revocation publishes no event; the event schema is still attestation writes only.
+Revocation publishes a `revoke` event; see "Attestation events" above for its
+topic layout and the other event schemas.
 
 ## Using it
 
@@ -491,72 +659,121 @@ nothing in this change renumbers or moves a bit — it only names the boundary.
 `evidence_hash` is `SHA-256` over a canonical rendering of the report, produced
 by [`internal/attest`](../internal/attest) and printable with
 `assay attestation -preimage CODE-ISSUER`. The encoding is line-oriented,
-tab-separated, LF-terminated UTF-8:
+tab-separated, LF-terminated UTF-8. The first line is a version tag, and **each
+tag names exactly one layout**: the tag alone says which lines follow and in
+what order.
 
 ```
-assay-evidence-v1
+assay-evidence-v2
 asset	CODE-ISSUER
 severity	N
 base_severity	N
 escalated	true|false
 mechanics	N
 accountability	unknown|unverified|verified
-checks	ID1,ID2,...
 evidence	SOURCE	URL	CLAIM
 ```
 
-A report that binds its check set is written as `assay-evidence-v2`, which adds
-one line after `accountability`:
+That is the complete v1 layout. **A v1 preimage has no `checks` line**, not
+even an empty one. Every attestation on chain today was hashed over exactly
+these bytes. An encoder that emitted `checks<TAB>` for v1 reports broke every
+one of them ([#269](https://github.com/use-assay/Assay/issues/269)), and the
+verifier now refuses those bytes as an invalid v1 preimage.
+
+Later encodings add lines in fixed positions. The bindings are cumulative:
+
+| Tag | Lines after the version line, before the evidence lines | Report bindings |
+| --- | --- | --- |
+| `assay-evidence-v1` | `asset` … `accountability` | none |
+| `assay-evidence-v2` | `asset` … `accountability`, `checks` | check set |
+| `assay-evidence-v3` | `asset` … `accountability`, `checks`, `network` | check set, network |
+| `assay-evidence-v4` | `scanner`, `asset` … `accountability`, `checks`, `network` | check set, network, scanner |
 
 ```
-checks	ID,ID,...        (the checks the engine ran, sorted)
-```
-
-A report that also names its network is written as `assay-evidence-v3`, which
-adds one line after `checks` — or after `accountability` when no check set is
-bound:
-
-```
-network	PASSPHRASE      (the ledger the facts were read from)
+checks	ID,ID,...        (v2+: the checks the engine ran, sorted, never empty)
+network	PASSPHRASE      (v3+: the ledger the facts were read from)
+scanner	VERSION         (v4: immediately after the version line)
 ```
 
 `PASSPHRASE` is the full Stellar network passphrase, not a short name:
 `Public Global Stellar Network ; September 2015` for pubnet, `Test SDF Network
 ; September 2015` for testnet. The passphrase is the one network identifier the
-ecosystem already agrees on, and the value is fixed by the protocol — it is not
+ecosystem already agrees on, and the value is fixed by the protocol. It is not
 configuration.
 
-Reports produced before check-set binding carry no `checks` line and are still
-written as `v1`, so an attestation already on-chain keeps reproducing its hash.
-A verifier reads a report with no bound check set as *unknown*, never as
-complete. The same rule covers the network: reports produced before network
-binding carry no `network` line and keep their earlier encoding (`v1` if no
-check set is bound, `v2` otherwise), so every attestation written before this
-change still reproduces its hash. The version line names the newest binding the
-report carries, and each version's rendering is cumulative — a v3 report with
-no bound check set carries the network line but not the checks line.
+#### Report fields outside the preimage
 
-The committed vectors `network-bound-pubnet` and `network-bound-testnet` in
-`internal/attest/testdata/vectors` are byte-identical except for the network
-line and hash differently, which is the property this encoding exists for.
+Some report fields are rendered in the JSON and CLI output but are deliberately
+not part of the hashed evidence preimage: `state`, `stale`, `undetermined`,
+`undetermined_checks`, `undetermined_rate`, `scanned_at`, and
+`accountability_reason`. They describe the report's completeness and the
+classification of its verdict, not the evidence the verdict commits to, so they
+move nothing in `evidence_hash`.
+
+`accountability_reason` was added in #367 to split the two facts that
+`accountability: unverified` had collapsed — `fetch_failed` (the stellar.toml
+could not be read) from `not_claimed` (it was fetched and does not name this
+asset), plus `mismatch` (the advertised home_domain disagrees with the curated
+directory) and `no_home_domain` (there was no claim to verify, so
+`accountability` is `unknown`). Because it is not evidence, the preimage
+encoding is unchanged: `accountability` still renders one of `unknown`,
+`unverified`, `verified`, and there is no `assay-evidence-v5`. The distinction
+already survives in the attributed evidence claim text (for example
+`not retrievable: status 404` versus `CURRENCIES lists ... none matching`);
+`accountability_reason` merely makes it machine-readable from JSON alone.
+
+A report whose bindings are not one of the four rows above (a network without
+a check set, or a scanner without both) has no tag. `attest.FromReport` refuses
+it with `ErrUnencodable`. No production path produces one: `Engine.Run` binds
+the check set, and `scan.Scanner` binds the network and the scanner.
+
+The committed vectors in `internal/attest/testdata/vectors` cover every tag:
+the v1 set (including `aqua-`, `usdc-` and `usdz-mainnet-onchain`, whose digests
+are the on-chain hashes), `checkset-bound-v2`, the `network-bound-pubnet` /
+`network-bound-testnet` pair for v3 (byte-identical except for the network
+line, which is the property v3 exists for), and `scanner-network-bound-v4`.
+
+#### One tag, one layout ([#270](https://github.com/use-assay/Assay/issues/270))
+
+Before this decision, `assay-evidence-v3` covered three layouts: scanner only,
+network only, and both. Two independent changes (scanner identity, #40; network,
+#41) each claimed v3, and a reimplementer reading the tag could not know whether
+to expect a `scanner` line. Two fixes were considered:
+
+- *Make every v3 line mandatory.* This keeps one tag, but it forces a single
+  combined layout on reports that bind only some of the fields.
+- *Give each layout its own tag.* **Chosen.** v3 keeps the layout its committed
+  vectors already pin (checks + network), and the scanner layout becomes v4. Any
+  combination outside the cumulative chain is refused, not tagged.
+
+The verifier enforces the same table. `assay verify` and `attest.ParsePreimage`
+refuse a preimage whose lines do not match its own tag: a `checks` line under
+v1, a v3 preimage without `network`, a `scanner` line under any tag but v4.
+`TestPreimageVersionIsInjective` enumerates all eight combinations of the three
+bindings.
+
+**Migration impact.** None on chain: all ten attestations are v1, and v1 is
+unchanged. The committed v3 vectors keep their bytes and digests. Two kinds of
+off-chain bytes are no longer producible. A scanner-bound preimage tagged v3
+was emitted only by tests, because nothing set the binding (#271). A
+network-only v3 preimage with no checks line comes from a report with a
+network and no check set, which no production path creates. A verifier
+holding either is told the tag and the layout disagree.
 
 #### The preimage binds the scanner identity
 
-A report that also names the code that produced it is written as
-`assay-evidence-v3`, which adds one line **immediately after the version
-line** (identity before content), specified precisely enough to reimplement
-(issue #40):
+The v4 `scanner` line names the code that produced the report (issue #40):
 
 ```
 scanner	VERSION
 ```
 
-`VERSION` is the scanner's Go **module version** — the string recorded by
-`go version -m` for the `github.com/use-assay/assay` module, e.g. `v1.2.3` —
-or the literal `devel` when the binary was built from source without a
-version stamp. The value is taken from `attest.ScannerIdentity`
-(`internal/attest/attest.go`), escaped like every other field (inside any
-field, `\` becomes `\\`, tab becomes `\t`, and so on).
+`VERSION` is the scanner's Go **module version**, the string recorded by
+`go version -m` for the `github.com/use-assay/assay` module (e.g. `v1.2.3`), or
+the literal `devel` for any build that is not a clean release tag. The value is
+taken from `attest.ScannerIdentity` (`internal/attest/attest.go`) and is
+escaped once, like every other field: inside any field, `\` becomes `\\`, tab
+becomes `\t`, and so on.
 
 **Why the module version and not a build-stamped commit.** A commit stamp
 would make every local dev build produce a different hash for identical
@@ -565,27 +782,47 @@ hash exists for. The module version changes exactly when the code changes,
 is stable across machines for a given release, and is verifiable by anyone
 who can run the module. `devel` is a deliberate sentinel: a hash produced by
 an unstamped build is distinguishable from any tagged release rather than
-silently pretending to be one. A report opts into this encoding through
-`Report.ScannerBound`; reports that do not set it keep their exact v1/v2
-bytes.
+silently pretending to be one. Since Go 1.24, `go build` in a git checkout
+stamps a pseudo-version such as `v0.0.0-20261018200841-38b5825719ba`, with
+`+dirty` for a modified tree. `internal/version` reports those as `devel` too,
+because a pseudo-version *is* a commit stamp.
+
+**Where the binding is switched on
+([#271](https://github.com/use-assay/Assay/issues/271)).** In
+`scan.Scanner.Scan` and `scan.Scanner.ScanWithHolder`, which set
+`Report.ScannerBound` on every report they return. That is the entry point that
+performs a live scan, and it already binds the network for the same reason.
+`Engine.Run` does not set it, because tests and the eval harness drive it with
+fixtures. `attest.FromReport` does not set it either, because it derives
+arguments from a report it did not produce and must not add claims to it. Every
+`assay scan`, `assay attestation` and API scan is therefore written under v4.
+`TestScanBindsTheScanner` in `internal/scan` fails if a `scan.Scanner` report is
+not scanner-bound.
 
 This closes the downgrade hole: two scanner versions that classify an asset
-differently previously produced equally valid hashes, and a downgrade to a
-version with a known bug was undetectable. Under v3 the hashed bytes name
-their producer, so the same evidence hashed by different scanner versions
-cannot collide.
+differently used to produce equally valid hashes, so a downgrade to a version
+with a known bug was undetectable. Under v4 the hashed bytes name their
+producer, so the same evidence hashed by different scanner versions cannot
+collide.
 
-**Migration for the ten v1 attestations on chain.** They are hashed under
-v1/v2 encodings and **verify only under those encodings**: a verifier must
-reproduce their bytes without the scanner line (reports that do not set
-`ScannerBound` do exactly that). They are NOT re-attested as part of this
-change — re-attestation is a maintainer decision with a signing ceremony, and
-nothing here can or should do it silently. New attestations SHOULD be written
-under v3 (bind their scanner) so the downgrade guarantee applies to them. A
-future re-attestation pass would move the live set to v3; until then,
-`docs/deployment.md` remains the record of which encoding each live
-attestation verifies under (v1: pre-check-set writes; v3: anything attested
-after this change lands).
+**Re-deriving an attestation written under an older encoding.** The ten
+attestations on chain are v1, and a scan today is v4. To compare the two,
+render the fresh scan under the attestation's own encoding:
+
+```sh
+assay attestation -raw -preimage-version v1 CODE-ISSUER
+```
+
+`-preimage-version` (`attest.PreimageAs` / `attest.FromReportAs`) withholds the
+bindings the named encoding predates. It never adds one: asking for v3 from a
+report with no network is `ErrUnencodable`. `scripts/reproducibility.sh` passes
+each asset's `Preimage` column from [deployment.md](deployment.md) this way. A v1 attestation still reproduces
+only if the evidence claims the scanner emits are unchanged, so a code change
+that adds or rewords a claim breaks reproduction exactly as a change at the
+source would. The ten attestations are NOT re-attested as part of this change.
+Re-attestation is a maintainer decision with a signing ceremony, and nothing
+here can or should do it silently. A future re-attestation would be written
+under v4.
 
 with one `evidence` line per attributed claim, sorted bytewise. Inside any
 field, `\` becomes `\\`, tab becomes `\t`, newline `\n`, carriage return `\r`.
@@ -630,7 +867,19 @@ cost is that the hash cannot distinguish a fresh confirmation from a stale one
   reimplementer must refuse it the same way.
 
 The version line is inside the hash, so a future encoding change cannot produce
-bytes a verifier would silently compare against v1.
+bytes a verifier would silently compare against v2. Historical v1 attestations
+must continue to use the v1 rules and cannot be silently interpreted as v2.
+
+### Canonicalization of fetch failures
+
+Transport failures from `stellar.toml` are canonicalized before hashing. The
+allowed values are a closed set: `dns-failure`, `connection-refused`,
+`tls-failure`, `timeout`, `status N`, and `unknown-failure`. The URL field for a
+failed fetch is the fixed value `stellar.toml`. Hostnames, resolver addresses,
+IP addresses, ports, retry counts, timing values, and raw library error text are
+environmental transport variables, so including them would make identical
+evidence hash differently across machines. The raw error is still retained in
+the human diagnostics and reasoning response.
 
 #### The preimage binds the check set
 
@@ -651,18 +900,19 @@ to compare.
 
 The check-set binding is a v2 rather than an amendment to v1 deliberately: an
 attestation written under v1 omitted the check set entirely, and re-hashing it
-under a changed v1 format would break every existing attestation.
+under a changed v1 format would break every existing attestation. That is also
+why the v1 layout must not carry an empty `checks` line (#269).
 
 ### The preimage binds the network
 
 An asset code and issuer can exist on two networks with different flags, and
 Assay's attestations are currently written to testnet while scanning pubnet —
-so before the v3 encoding, a pubnet scan and a testnet scan of the same
+so before network binding, a pubnet scan and a testnet scan of the same
 identifier produced indistinguishable preimages, and an attestation could not
 prove which ledger it describes.
 
-The v3 encoding closes that: the network passphrase is part of the preimage, so
-the same facts read from two ledgers hash differently. `scan.Scanner` resolves
+The v3 encoding closes that, and v4 keeps it: the network passphrase is part of
+the preimage, so the same facts read from two ledgers hash differently. `scan.Scanner` resolves
 the network before any fetch — from the Horizon base URL when it is an
 SDF-operated host, cross-checked against an explicit `Network` declaration —
 and refuses to scan when neither can name it, or when the two contradict. A
@@ -672,6 +922,97 @@ pubnet facts under a testnet contract.
 An undeterminable network is an error, never a default, for the same reason an
 unread flag is `Unevaluated` rather than `Clear`: a guessed network name in a
 hashed field is a false attestation waiting to be written.
+
+### Formal grammar (ABNF)
+
+The prose above states the intent; this grammar is the contract. It is
+written per [RFC 5234](https://www.rfc-editor.org/rfc/rfc5234) over bytes
+(LF-terminated UTF-8 lines, HTAB-separated fields), and it describes exactly
+what `attest.Preimage` emits. There is one production per version tag, so the
+tag determines the layout. The machine-readable suite in
+[`conformance/`](../conformance) pins one or more cases per rule;
+`internal/attest/conformance_test.go` runs it in CI and fails if any grammar
+rule is uncovered. Any other implementation can run the same cases from the
+JSON alone, without reading the Go code.
+
+```abnf
+; Canonical evidence preimage. Byte-oriented: the ranges below are bytes,
+; so a multi-byte UTF-8 sequence passes through as its constituent bytes.
+; Literal strings are case-sensitive.
+
+preimage        = v1-preimage / v2-preimage / v3-preimage / v4-preimage
+
+; One layout per tag (#270). The bindings are cumulative: checks, then
+; network, then scanner. No other combination has a tag.
+v1-preimage     = "assay-evidence-v1" LF field-lines *evidence-line
+v2-preimage     = "assay-evidence-v2" LF field-lines checks-line *evidence-line
+v3-preimage     = "assay-evidence-v3" LF field-lines checks-line network-line
+                  *evidence-line
+v4-preimage     = "assay-evidence-v4" LF scanner-line field-lines checks-line
+                  network-line *evidence-line
+
+; The scanner's module version or the literal "devel", escaped like every
+; other field. Set on every report scan.Scanner produces (#271).
+scanner-line    = "scanner" HTAB escaped-value LF
+
+; v1 is exactly these lines: no checks line, not even an empty one (#269).
+field-lines     = asset-line
+                  severity-line
+                  base-severity-line
+                  escalated-line
+                  mechanics-line
+                  accountability-line
+
+asset-line      = "asset" HTAB escaped-value LF
+severity-line   = "severity" HTAB 1*DIGIT LF
+base-severity-line = "base_severity" HTAB 1*DIGIT LF
+escalated-line  = "escalated" HTAB ("true" / "false") LF
+mechanics-line  = "mechanics" HTAB 1*DIGIT LF
+accountability-line = "accountability" HTAB accountability LF
+accountability  = "unknown" / "unverified" / "verified"
+
+; The bound check set, sorted. Never empty: a report with no check set is v1.
+checks-line     = "checks" HTAB check-list LF
+check-list      = check-id *("," check-id)
+check-id        = 1*(ALPHA / DIGIT / "-" / "_")
+
+network-line    = "network" HTAB escaped-value LF
+
+; One line per attributed claim. Constraint outside the grammar: the
+; evidence lines are sorted bytewise across the RENDERED lines (including
+; the "evidence" key and separators), so reordering checks or claims does
+; not move the hash.
+evidence-line   = "evidence" HTAB escaped-value HTAB escaped-value HTAB escaped-value LF
+
+escaped-value   = *(safe-char / escaped)
+escaped         = %x5C.5C          ; \\ — a literal backslash
+                / %x5C.74          ; \t — HTAB
+                / %x5C.6E          ; \n — LF
+                / %x5C.72          ; \r — CR
+safe-char       = %x00-09 / %x0B-0C / %x0E-5B / %x5D-FF
+                  ; every byte except HTAB (09), LF (0A), CR (0D),
+                  ; and backslash (5C) — the four escaping covers
+```
+
+Version selection is part of the contract: a report is written under the one
+tag whose bindings it carries (the table at the top of this section), and a
+report whose bindings match no tag is refused with `ErrUnencodable`, never
+written under the nearest tag.
+
+Version selection describes the bytes a *fresh* report is written under. To
+reproduce an attestation already on chain, render the version that record
+names instead: `attest.PreimageAs` (and `assay attestation -preimage-version
+vN`) apply the rules above to the requested version rather than to the report's
+own, so a v1 rendering of a report that holds bindings omits the checks,
+network and scanner lines v1 never had. Comparing a fresh scan's default
+rendering against a v1 record would compare unlike bytes; this is the rendering
+path that makes the comparison meaningful.
+
+Two more rules are load-bearing even though no production rule can express
+them: severity and mechanics render as decimal integers of their bit values,
+not as the names the report JSON uses (the bit/name table is the ABI section
+above), and retrieval timestamps are excluded entirely, so a conformance
+input's `retrieved_at` never appears in the expected preimage.
 
 ## Not done yet
 

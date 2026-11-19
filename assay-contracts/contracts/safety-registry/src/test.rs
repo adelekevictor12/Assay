@@ -1,16 +1,32 @@
 #![cfg(test)]
 
+extern crate std;
+
 pub mod fail_closed;
 
 use super::*;
 use soroban_sdk::{
     symbol_short,
-    testutils::{Address as _, Events as _, Ledger as _, MockAuth, MockAuthInvoke},
+    testutils::{Address as _, EnvTestConfig, Events as _, Ledger as _, MockAuth, MockAuthInvoke},
     vec, BytesN, Env, IntoVal, Map, Symbol, Vec,
 };
 
 fn setup() -> (Env, SafetyRegistryClient<'static>, Address) {
     let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(SafetyRegistry, ());
+    let client = SafetyRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.init(&admin);
+
+    (env, client, admin)
+}
+
+fn cost_setup() -> (Env, SafetyRegistryClient<'static>, Address) {
+    let env = Env::new_with_config(EnvTestConfig {
+        capture_snapshot_at_drop: false,
+    });
     env.mock_all_auths();
 
     let contract_id = env.register(SafetyRegistry, ());
@@ -129,6 +145,120 @@ fn attest_rejects_out_of_range_severity() {
         .expect_err("severity above critical must be rejected");
 
     assert_eq!(err, Ok(Error::InvalidSeverity));
+}
+
+// ---------------------------------------------------------------------------
+// Asset address validation (#349)
+// ---------------------------------------------------------------------------
+
+/// The registry is not an asset. A write keyed on the registry's own address
+/// would store `DataKey::Safety(registry)` inside the registry, and its event
+/// would read as the registry attesting itself — so it is refused outright
+/// rather than left to be harmless-looking pollution.
+#[test]
+fn attest_rejects_the_registrys_own_address() {
+    let (env, client, _) = setup();
+
+    let err = client
+        .try_attest(&client.address.clone(), &SEVERITY_CLEAR, &0, &hash(&env))
+        .expect_err("the registry must not attest itself");
+
+    assert_eq!(err, Ok(Error::InvalidAsset));
+    assert_eq!(client.get_safety(&client.address), None);
+    assert_eq!(
+        env.events().all().filter_by_contract(&client.address),
+        vec![&env],
+        "a rejected address must publish no event"
+    );
+}
+
+/// The admin is the writer, never the subject. The admin is usually an
+/// account, which the type check below already covers, so this pins the direct
+/// comparison too — `init` accepts any `Address`, including a contract.
+#[test]
+fn attest_rejects_the_admin_address() {
+    let (env, client, admin) = setup();
+
+    let err = client
+        .try_attest(&admin, &SEVERITY_CLEAR, &0, &hash(&env))
+        .expect_err("the admin address is not an asset");
+
+    assert_eq!(err, Ok(Error::InvalidAsset));
+    assert_eq!(client.get_safety(&admin), None);
+}
+
+/// A Stellar Asset Contract is a contract, so an account address can be ruled
+/// out by reading the address's type tag alone. This is the fat-finger case
+/// the check exists for: pasting an issuer account where a SAC address belongs
+/// would otherwise be keyed, rented and published as if it were the asset.
+#[test]
+fn attest_rejects_a_non_contract_address() {
+    let (env, client, _) = setup();
+    // The live attester/admin account from docs/deployment.md: a real G… key,
+    // the exact string a mis-paste would produce.
+    let issuer_account = Address::from_str(
+        &env,
+        "GALIEUOBDLTFJHTVH5E3MT2BMDTQ3PKMX2U6BRXVKLEB7ARFORFNNMVY",
+    );
+
+    let err = client
+        .try_attest(&issuer_account, &SEVERITY_CLEAR, &0, &hash(&env))
+        .expect_err("an account address can never be a Stellar Asset Contract");
+
+    assert_eq!(err, Ok(Error::InvalidAsset));
+    // Nothing keyed and nothing published: refused, not recorded.
+    assert_eq!(client.get_safety(&issuer_account), None);
+    assert_eq!(
+        env.events().all().filter_by_contract(&client.address),
+        vec![&env]
+    );
+}
+
+/// The address rule is enforced on the batch path by the same shared
+/// validation, so a bad address in the middle of a batch writes nothing —
+/// not the elements before it, not the elements after it, not itself.
+#[test]
+fn batch_with_an_invalid_asset_address_writes_nothing() {
+    let (env, client, admin) = setup();
+    let before = Address::generate(&env);
+    let after = Address::generate(&env);
+
+    for offender in [
+        admin.clone(),
+        client.address.clone(),
+        Address::from_str(
+            &env,
+            "GALIEUOBDLTFJHTVH5E3MT2BMDTQ3PKMX2U6BRXVKLEB7ARFORFNNMVY",
+        ),
+    ] {
+        let err = client
+            .try_attest_many(&vec![
+                &env,
+                att(&env, &before, SEVERITY_CLEAR, 0),
+                att(&env, &offender, SEVERITY_CLEAR, 0),
+                att(&env, &after, SEVERITY_CLEAR, 0),
+            ])
+            .expect_err("a batch containing an invalid address must be rejected");
+
+        assert_eq!(err, Ok(Error::InvalidAsset));
+
+        assert_eq!(
+            client.get_safety(&before),
+            None,
+            "element before the bad one"
+        );
+        assert_eq!(client.get_safety(&after), None, "element after the bad one");
+        assert_eq!(
+            client.get_safety(&offender),
+            None,
+            "the invalid element itself"
+        );
+        assert_eq!(
+            env.events().all().filter_by_contract(&client.address),
+            vec![&env],
+            "a rejected batch must publish no events"
+        );
+    }
 }
 
 /// Even if a bad attestation somehow existed, a gate below High must not admit
@@ -287,6 +417,8 @@ fn attest_publishes_no_event_on_rejection() {
         &MECH_CLAWBACK_ENABLED,
         &hash(&env),
     );
+    // InvalidAsset.
+    let _ = client.try_attest(&client.address.clone(), &SEVERITY_CLEAR, &0, &hash(&env));
 
     assert_eq!(
         env.events().all().filter_by_contract(&client.address),
@@ -604,6 +736,7 @@ fn error_code_values_are_abi() {
     assert_eq!(Error::NotAttested as u32, 5);
     assert_eq!(Error::NoPendingAdmin as u32, 6);
     assert_eq!(Error::BatchTooLarge as u32, 7);
+    assert_eq!(Error::InvalidAsset as u32, 8);
 }
 
 /// A successful revoke emits one event with topics ("revoke", asset).
@@ -712,6 +845,58 @@ fn ttl_revoke_extends_instance_to_network_max() {
     assert_eq!(instance_ttl(&env, &client), max - 10_000);
 
     client.revoke(&asset);
+    assert_eq!(instance_ttl(&env, &client), max);
+}
+
+/// transfer_admin and accept_admin are writes and extend the instance TTL
+/// to the network maximum, matching the other write entrypoints.
+#[test]
+fn ttl_admin_transfer_entrypoints_extend_instance_to_network_max() {
+    let env = Env::default();
+    let contract_id = env.register(SafetyRegistry, ());
+    let client = SafetyRegistryClient::new(&env, &contract_id);
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+    client.init(&a);
+
+    let max = max_ttl(&env, &client);
+
+    // Advance sequence: instance TTL decays.
+    let seq = env.ledger().sequence();
+    env.ledger().set_sequence_number(seq + 10_000);
+    assert_eq!(instance_ttl(&env, &client), max - 10_000);
+
+    // transfer_admin extends instance TTL to max.
+    client
+        .mock_auths(&[MockAuth {
+            address: &a,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "transfer_admin",
+                args: (&b,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .transfer_admin(&b);
+    assert_eq!(instance_ttl(&env, &client), max);
+
+    // Advance sequence again.
+    let seq2 = env.ledger().sequence();
+    env.ledger().set_sequence_number(seq2 + 10_000);
+    assert_eq!(instance_ttl(&env, &client), max - 10_000);
+
+    // accept_admin extends instance TTL to max.
+    client
+        .mock_auths(&[MockAuth {
+            address: &b,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "accept_admin",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .accept_admin();
     assert_eq!(instance_ttl(&env, &client), max);
 }
 
@@ -1206,8 +1391,8 @@ fn attest_many_rejects_unauthorized_caller() {
 /// | ledger entries written | 200 | 51 |
 /// | transaction footprint entries | 400 | 105 |
 /// | bytes written | 132 096 | 14 072 |
-/// | instructions | 400 000 000 | 3 275 513 |
-/// | memory | 41 943 040 | 514 609 |
+/// | instructions | 400 000 000 | 3 383 545 |
+/// | memory | 41 943 040 | 544 276 |
 #[test]
 fn batch_size_bound_is_measured_and_holds_headroom() {
     let (env, client, _) = setup();
@@ -1375,6 +1560,304 @@ fn attestations_survive_admin_transfer_and_follow_the_new_admin() {
     assert!(client.get_safety(&other).is_some());
 }
 
+#[test]
+fn admin_and_pending_admin_getters_reflect_lifecycle() {
+    let env = Env::default();
+    let contract_id = env.register(SafetyRegistry, ());
+    let client = SafetyRegistryClient::new(&env, &contract_id);
+
+    // Before init: both return None
+    assert_eq!(client.admin(), None);
+    assert_eq!(client.pending_admin(), None);
+
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+    client.init(&a);
+
+    // After init: admin is Some(a), pending_admin is None
+    assert_eq!(client.admin(), Some(a.clone()));
+    assert_eq!(client.pending_admin(), None);
+
+    // Transfer initiated: admin is still Some(a), pending_admin is Some(b)
+    client
+        .mock_auths(&[MockAuth {
+            address: &a,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "transfer_admin",
+                args: (&b,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .transfer_admin(&b);
+
+    assert_eq!(client.admin(), Some(a));
+    assert_eq!(client.pending_admin(), Some(b.clone()));
+
+    // Transfer accepted: admin is Some(b), pending_admin is cleared back to None
+    client
+        .mock_auths(&[MockAuth {
+            address: &b,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "accept_admin",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .accept_admin();
+
+    assert_eq!(client.admin(), Some(b));
+    assert_eq!(client.pending_admin(), None);
+}
+
+/// Only the current admin may nominate a successor. The `MockAuth` grants the
+/// intruder authorization for this very call, so the rejection below is the
+/// contract's `require_auth` on the stored admin and not an artefact of the
+/// harness — without it (mutation R-M6) the call succeeds.
+///
+/// The probe after the rejection is what makes the state observable: if the
+/// nomination had landed, `accept_admin` would promote the proposed address,
+/// so a refusal with `NoPendingAdmin` proves nothing was written. This test
+/// also keeps `transfer_admin` honest about its caller in a way the happy-path
+/// transfer in `attestations_survive_admin_transfer_and_follow_the_new_admin`
+/// cannot: that test mocks auth for the admin, and an entrypoint with
+/// `require_auth` deleted passes it unchanged.
+#[test]
+fn transfer_admin_rejects_unauthorized_caller() {
+    let env = Env::default();
+    let contract_id = env.register(SafetyRegistry, ());
+    let client = SafetyRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.init(&admin);
+
+    let intruder = Address::generate(&env);
+    let proposed = Address::generate(&env);
+
+    let err = client
+        .mock_auths(&[MockAuth {
+            address: &intruder,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "transfer_admin",
+                args: (&proposed,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_transfer_admin(&proposed)
+        .expect_err("a non-admin must not nominate a pending admin");
+    // As in `revoke_rejects_unauthorized_caller`, the rejection is the host's
+    // auth error rather than a contract `Error`; what matters is that it is one.
+    assert!(err.is_err());
+
+    // Nothing was written: there is no pending nomination to accept.
+    env.mock_all_auths();
+    let err = client
+        .try_accept_admin()
+        .expect_err("the rejected nomination must leave no pending admin");
+    assert_eq!(err, Ok(Error::NoPendingAdmin));
+}
+
+/// A completed transfer consumes the pending nomination. After `accept_admin`,
+/// a replay — by the new admin or anyone holding their key — must fail with
+/// `NoPendingAdmin` instead of re-running the promotion: an accepted
+/// nomination is gone, not merely superseded. Removing the cleanup
+/// (mutation R-M7) leaves the pending address set, and the replay below
+/// succeeds instead of failing.
+#[test]
+fn accept_admin_consumes_the_pending_nomination() {
+    let (env, client, _admin) = setup();
+    let successor = Address::generate(&env);
+
+    client.transfer_admin(&successor);
+    client.accept_admin();
+
+    // The promotion happened and the nomination it consumed is gone.
+    let err = client
+        .try_accept_admin()
+        .expect_err("a pending nomination must not survive its own acceptance");
+    assert_eq!(err, Ok(Error::NoPendingAdmin));
+
+    // The slot is reusable: a later nomination is written, consumed, and
+    // consumed only once, so the cleanup is not "remove on first transfer".
+    let later = Address::generate(&env);
+    client.transfer_admin(&later);
+    client.accept_admin();
+    let err = client
+        .try_accept_admin()
+        .expect_err("the second nomination must be consumed by its acceptance");
+    assert_eq!(err, Ok(Error::NoPendingAdmin));
+}
+
+/// A registry that has never seen a nomination must refuse `accept_admin` with
+/// `NoPendingAdmin`, not succeed quietly and not fail on auth. This is the
+/// plain form of the state the probes in
+/// `transfer_admin_rejects_unauthorized_caller` and
+/// `accept_admin_consumes_the_pending_nomination` meet as a residue: here the
+/// slot starts empty, so a mutated `accept_admin` that invents an admin (or
+/// reads an uncleared slot as present) is caught on a fresh registry too.
+#[test]
+fn accept_admin_without_a_pending_nomination_returns_no_pending_admin() {
+    let (_env, client, _admin) = setup();
+
+    let err = client
+        .try_accept_admin()
+        .expect_err("accept without a nomination must be refused");
+    assert_eq!(err, Ok(Error::NoPendingAdmin));
+}
+
+/// Only the nominated address may complete the transfer. The `MockAuth` grants
+/// the intruder authorization for this very call, so the rejection below is
+/// the contract's `require_auth` on the stored `PendingAdmin` and not an
+/// artefact of the harness — without it (mutation R-M9) the call succeeds and
+/// the promotion happens on the intruder's initiative. Admin rotation decides
+/// who may write attestations, so "the wrong key cannot turn the lock" is the
+/// property, and the probe after the rejection shows what the failed accept
+/// left behind: the nomination still belongs to the successor, who completes
+/// it, and the intruder never holds the role.
+#[test]
+fn accept_admin_rejects_a_caller_other_than_the_pending_admin() {
+    let env = Env::default();
+    let contract_id = env.register(SafetyRegistry, ());
+    let client = SafetyRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.init(&admin);
+
+    env.mock_all_auths();
+    let successor = Address::generate(&env);
+    client.transfer_admin(&successor);
+
+    let intruder = Address::generate(&env);
+    let err = client
+        .mock_auths(&[MockAuth {
+            address: &intruder,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "accept_admin",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_accept_admin()
+        .expect_err("only the pending admin may accept the transfer");
+    // As in `transfer_admin_rejects_unauthorized_caller`, the rejection is the
+    // host's auth error rather than a contract `Error`; what matters is that
+    // it is one and that it changed nothing.
+    assert!(err.is_err());
+
+    // The failed accept consumed nothing: the successor's own nomination is
+    // still the one in the slot, and completing it installs the successor.
+    env.mock_all_auths();
+    client.accept_admin();
+
+    // The intruder never held the role: a write under the intruder's own
+    // explicit authorization is still refused, while the successor's lands.
+    let asset = Address::generate(&env);
+    let err = client
+        .mock_auths(&[MockAuth {
+            address: &intruder,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "attest",
+                args: (&asset, SEVERITY_CLEAR, 0u32, hash(&env)).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_attest(&asset, &SEVERITY_CLEAR, &0, &hash(&env))
+        .expect_err("the intruder must not gain the admin role");
+    assert!(err.is_err());
+
+    client
+        .mock_auths(&[MockAuth {
+            address: &successor,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "attest",
+                args: (&asset, SEVERITY_CLEAR, 0u32, hash(&env)).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .attest(&asset, &SEVERITY_CLEAR, &0, &hash(&env));
+    assert!(client.get_safety(&asset).is_some());
+}
+
+/// A second nomination replaces the first; it does not queue behind it and it
+/// does not merge with it. The superseded address must find the door locked —
+/// its own authorization no longer matches the stored `PendingAdmin` — and the
+/// superseding one must find it open, after which the nomination is consumed
+/// as usual. Writing `PendingAdmin` only when the slot is empty (mutation
+/// R-M10) makes the first nomination sticky: the superseded address would
+/// still accept, and the assertion below that its accept fails is the catch.
+/// The final probes tie the completed transfer to the role itself: the old
+/// admin loses `attest`, the superseding admin gains it.
+#[test]
+fn second_transfer_admin_nomination_supersedes_the_first() {
+    let env = Env::default();
+    let contract_id = env.register(SafetyRegistry, ());
+    let client = SafetyRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.init(&admin);
+    env.mock_all_auths();
+
+    let first = Address::generate(&env);
+    let superseding = Address::generate(&env);
+    client.transfer_admin(&first);
+    client.transfer_admin(&superseding);
+
+    let err = client
+        .mock_auths(&[MockAuth {
+            address: &first,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "accept_admin",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_accept_admin()
+        .expect_err("a superseded nomination must not be acceptable");
+    assert!(err.is_err());
+
+    // The slot holds exactly one nomination — the second one. It accepts, and
+    // is consumed, exactly as an uncontested nomination would be.
+    env.mock_all_auths();
+    client.accept_admin();
+    let err = client
+        .try_accept_admin()
+        .expect_err("the superseding nomination must be consumed by its acceptance");
+    assert_eq!(err, Ok(Error::NoPendingAdmin));
+
+    // The role followed the nomination that was accepted: the old admin's
+    // write is refused, the superseding admin's lands.
+    let asset = Address::generate(&env);
+    let err = client
+        .mock_auths(&[MockAuth {
+            address: &admin,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "attest",
+                args: (&asset, SEVERITY_CLEAR, 0u32, hash(&env)).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .try_attest(&asset, &SEVERITY_CLEAR, &0, &hash(&env))
+        .expect_err("the old admin must not hold the role after any accept");
+    assert!(err.is_err());
+
+    client
+        .mock_auths(&[MockAuth {
+            address: &superseding,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "attest",
+                args: (&asset, SEVERITY_CLEAR, 0u32, hash(&env)).into_val(&env),
+                sub_invokes: &[],
+            },
+        }])
+        .attest(&asset, &SEVERITY_CLEAR, &0, &hash(&env));
+    assert!(client.get_safety(&asset).is_some());
+}
+
 /// `attest_many` is all-or-nothing (threat model class 3). The fixed-position
 /// test above covers one size and one position; this sweeps batch size
 /// (1…[`MAX_BATCH_SIZE`]), the position of the invalid element, and the kind of
@@ -1464,4 +1947,576 @@ fn attest_many_is_all_or_nothing_over_generated_batches() {
         seen_edges[0] && seen_edges[1],
         "the generator must reach both ends of a batch (seed={seed})"
     );
+}
+
+/// `transfer_admin` publishes exactly one `admin_transfer_proposed` event:
+/// the proposing admin is a topic, the proposed successor and the timestamp
+/// are in the data map, and the admin role itself is unchanged.
+#[test]
+fn transfer_admin_emits_admin_transfer_proposed() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(SafetyRegistry, ());
+    let client = SafetyRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    client.init(&admin);
+
+    env.ledger().set_timestamp(4_321);
+    client.transfer_admin(&new_admin);
+
+    let mut data = Map::<Symbol, soroban_sdk::Val>::new(&env);
+    data.set(Symbol::new(&env, "at"), 4_321u64.into_val(&env));
+    data.set(
+        Symbol::new(&env, "new_admin"),
+        new_admin.clone().into_val(&env),
+    );
+    assert_eq!(
+        env.events().all().filter_by_contract(&client.address),
+        vec![
+            &env,
+            (
+                client.address.clone(),
+                (Symbol::new(&env, "admin_transfer_proposed"), admin.clone()).into_val(&env),
+                data.into_val(&env),
+            ),
+        ],
+    );
+
+    let stored_pending: Option<Address> = env.as_contract(&client.address, || {
+        env.storage().instance().get(&DataKey::PendingAdmin)
+    });
+    assert_eq!(stored_pending, Some(new_admin));
+    let stored_admin: Address = env.as_contract(&client.address, || {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("admin unchanged")
+    });
+    assert_eq!(stored_admin, admin);
+}
+
+/// `accept_admin` publishes exactly one `admin_transferred` event: the
+/// replaced admin is a topic, the new admin and the timestamp are in the data
+/// map, the pending entry is cleared, and the new admin is stored.
+#[test]
+fn accept_admin_emits_admin_transferred() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(SafetyRegistry, ());
+    let client = SafetyRegistryClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    client.init(&admin);
+    client.transfer_admin(&new_admin);
+
+    env.ledger().set_timestamp(4_321);
+    client.accept_admin();
+
+    let mut data = Map::<Symbol, soroban_sdk::Val>::new(&env);
+    data.set(Symbol::new(&env, "at"), 4_321u64.into_val(&env));
+    data.set(
+        Symbol::new(&env, "new_admin"),
+        new_admin.clone().into_val(&env),
+    );
+    assert_eq!(
+        env.events().all().filter_by_contract(&client.address),
+        vec![
+            &env,
+            (
+                client.address.clone(),
+                (Symbol::new(&env, "admin_transferred"), admin.clone()).into_val(&env),
+                data.into_val(&env),
+            ),
+        ],
+    );
+
+    let stored_admin: Address = env.as_contract(&client.address, || {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("new admin stored")
+    });
+    assert_eq!(stored_admin, new_admin);
+    let stored_pending: Option<Address> = env.as_contract(&client.address, || {
+        env.storage().instance().get(&DataKey::PendingAdmin)
+    });
+    assert_eq!(stored_pending, None);
+}
+
+// ---------------------------------------------------------------------------
+// Interface version (#332) and batch read (#331)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn version_returns_interface_version() {
+    let (_env, client, _admin) = setup();
+    assert_eq!(client.version(), INTERFACE_VERSION);
+}
+
+/// The interface version is an ABI constant: it starts at 1 and only moves on
+/// a deliberate ABI change, which must be mirrored in docs/contract-interface.md.
+///
+/// Version 2 is the #349 change — `Error::InvalidAsset` joined the error set.
+/// Version 3 is the #284 change: the stored `Safety` gained `preimage_version`,
+/// so a reader can tell which evidence encoding its `evidence_hash` used.
+#[test]
+fn interface_version_is_abi() {
+    assert_eq!(INTERFACE_VERSION, 3);
+}
+
+/// Results come back in the order the assets were asked for, and an asset that
+/// was never attested reads as `None` without failing the whole call.
+#[test]
+fn get_safety_many_preserves_order_and_none_for_missing() {
+    let (env, client, _admin) = setup();
+    env.ledger().set_timestamp(1_000);
+
+    let first = Address::generate(&env);
+    let second = Address::generate(&env);
+    let missing = Address::generate(&env);
+
+    client.attest(&first, &SEVERITY_MEDIUM, &MECH_AUTH_REVOCABLE, &hash(&env));
+    client.attest(&second, &SEVERITY_CLEAR, &0, &hash(&env));
+
+    // `get_safety_many` returns the `Vec` directly (contract errors trap), so
+    // no `.expect()`: a batch within the bound always yields one answer per
+    // asset asked for, in order, with `None` for assets that were never
+    // attested or were revoked.
+    let got = client.get_safety_many(&vec![&env, first.clone(), missing.clone(), second.clone()]);
+    let expected = vec![
+        &env,
+        client.get_safety(&first),
+        None,
+        client.get_safety(&second),
+    ];
+    assert_eq!(got, expected);
+    assert_eq!(got.len(), 3u32);
+}
+
+/// A revoked asset reads as `None` in a batch too, and does not fail the call.
+#[test]
+fn get_safety_many_revoked_reads_as_none() {
+    let (env, client, _admin) = setup();
+    let asset = Address::generate(&env);
+
+    client.attest(&asset, &SEVERITY_CLEAR, &0, &hash(&env));
+    client.revoke(&asset);
+
+    let got = client.get_safety_many(&vec![&env, asset.clone()]);
+    assert_eq!(got.len(), 1u32);
+    assert_eq!(got.get(0u32), Some(None));
+}
+
+/// One asset over the cap is rejected outright: a batch read is bounded the
+/// same way `attest_many` is, and nothing is silently dropped.
+#[test]
+fn get_safety_many_over_the_bound_is_rejected() {
+    let (env, client, _admin) = setup();
+    let asset = Address::generate(&env);
+
+    let mut oversized = Vec::new(&env);
+    for _ in 0..=MAX_BATCH_SIZE {
+        oversized.push_back(asset.clone());
+    }
+    assert_eq!(oversized.len(), MAX_BATCH_SIZE + 1);
+
+    let err = client
+        .try_get_safety_many(&oversized)
+        .expect_err("a batch read larger than the cap must be rejected");
+    assert_eq!(err, Ok(Error::BatchTooLarge));
+
+    // The rejection reads nothing: the asset is still unattested.
+    assert_eq!(client.get_safety(&asset), None);
+}
+
+/// Exactly `MAX_BATCH_SIZE` assets are accepted, and every one is read back.
+#[test]
+fn get_safety_many_at_the_bound_is_accepted() {
+    let (env, client, _admin) = setup();
+    env.ledger().set_timestamp(1_234);
+
+    let mut assets = Vec::new(&env);
+    let mut batch = Vec::new(&env);
+    for _ in 0..MAX_BATCH_SIZE {
+        let asset = Address::generate(&env);
+        assets.push_back(asset.clone());
+        batch.push_back(att(&env, &asset, SEVERITY_CLEAR, 0));
+    }
+    assert_eq!(assets.len(), MAX_BATCH_SIZE);
+
+    client.attest_many(&batch);
+
+    let got = client.get_safety_many(&assets);
+    assert_eq!(got.len(), MAX_BATCH_SIZE);
+
+    // Every batch answer matches the single-asset read for the same asset.
+    let mut expected = Vec::new(&env);
+    for asset in assets.iter() {
+        expected.push_back(client.get_safety(&asset));
+    }
+    assert_eq!(got, expected);
+}
+
+/// The read cost at the bound is measured against the network's invocation
+/// limits, the same way `attest_many`'s cap is measured.
+#[test]
+fn get_safety_many_cost_at_the_bound() {
+    let (env, client, _admin) = setup();
+    env.ledger().set_timestamp(1_234);
+
+    let mut assets = Vec::new(&env);
+    let mut batch = Vec::new(&env);
+    for _ in 0..MAX_BATCH_SIZE {
+        let asset = Address::generate(&env);
+        assets.push_back(asset.clone());
+        batch.push_back(att(&env, &asset, SEVERITY_CLEAR, 0));
+    }
+    client.attest_many(&batch);
+
+    // This call is itself an assertion: the host enforces the network's limits,
+    // so exceeding one panics here instead of on a real ledger.
+    let _ = client.get_safety_many(&assets);
+
+    let r = env.cost_estimate().resources();
+    let footprint = r.disk_read_entries + r.memory_read_entries + r.write_entries;
+
+    assert_eq!(
+        r.contract_events_size_bytes, 0,
+        "a read-only batch publishes no events"
+    );
+    assert!(footprint <= 400, "footprint entries {footprint} exceed 400");
+    assert!(
+        r.instructions <= 400_000_000,
+        "instructions exceed 400 000 000"
+    );
+    assert!(r.mem_bytes <= 41_943_040, "memory exceeds 41 943 040");
+}
+
+const COST_BASELINE: &str = include_str!("../cost-baseline.json");
+const COST_TOLERANCE_PERCENT: i64 = 10;
+
+#[derive(Clone, Copy, Debug)]
+struct Cost {
+    instructions: i64,
+    mem_bytes: i64,
+    disk_read_bytes: i64,
+    write_bytes: i64,
+}
+
+fn invocation_cost(env: &Env) -> Cost {
+    let r = env.cost_estimate().resources();
+    Cost {
+        instructions: r.instructions,
+        mem_bytes: r.mem_bytes,
+        disk_read_bytes: i64::from(r.disk_read_bytes),
+        write_bytes: i64::from(r.write_bytes),
+    }
+}
+
+fn cost_scenarios() -> std::vec::Vec<(&'static str, Cost)> {
+    let mut costs = std::vec::Vec::new();
+
+    let (env, client, _) = cost_setup();
+    env.ledger().set_timestamp(1_234);
+    let asset = Address::generate(&env);
+    client.attest(&asset, &SEVERITY_MEDIUM, &MECH_AUTH_REVOCABLE, &hash(&env));
+    costs.push(("attest", invocation_cost(&env)));
+
+    let (env, client, _) = cost_setup();
+    env.ledger().set_timestamp(1_234);
+    let mut batch = Vec::new(&env);
+    for _ in 0..MAX_BATCH_SIZE {
+        batch.push_back(att(
+            &env,
+            &Address::generate(&env),
+            SEVERITY_MEDIUM,
+            MECH_AUTH_REVOCABLE,
+        ));
+    }
+    client.attest_many(&batch);
+    costs.push(("attest_many_50", invocation_cost(&env)));
+
+    let (env, client, _) = cost_setup();
+    env.ledger().set_timestamp(1_234);
+    let asset = Address::generate(&env);
+    client.attest(&asset, &SEVERITY_MEDIUM, &MECH_AUTH_REVOCABLE, &hash(&env));
+    let _ = client.get_safety(&asset);
+    costs.push(("get_safety", invocation_cost(&env)));
+
+    let (env, client, _) = cost_setup();
+    env.ledger().set_timestamp(1_234);
+    let asset = Address::generate(&env);
+    client.attest(&asset, &SEVERITY_MEDIUM, &MECH_AUTH_REVOCABLE, &hash(&env));
+    let _ = client.is_safe(&asset, &SEVERITY_MEDIUM, &0);
+    costs.push(("is_safe", invocation_cost(&env)));
+
+    let (env, client, _) = cost_setup();
+    env.ledger().set_timestamp(1_234);
+    let asset = Address::generate(&env);
+    client.attest(&asset, &SEVERITY_MEDIUM, &MECH_AUTH_REVOCABLE, &hash(&env));
+    let _ = client.is_safe_masked(&asset, &POLICY_MASK_FREEZE_INCLUSIVE, &0);
+    costs.push(("is_safe_masked", invocation_cost(&env)));
+
+    costs
+}
+
+#[test]
+fn entrypoint_costs_are_within_the_recorded_baseline() {
+    let measured = cost_scenarios();
+
+    if std::env::var("UPDATE_COST_BASELINE").as_deref() == Ok("1") {
+        let mut entrypoints = serde_json::Map::new();
+        for (name, cost) in &measured {
+            entrypoints.insert(
+                std::string::String::from(*name),
+                serde_json::json!({
+                    "instructions": cost.instructions,
+                    "mem_bytes": cost.mem_bytes,
+                    "disk_read_bytes": cost.disk_read_bytes,
+                    "write_bytes": cost.write_bytes,
+                }),
+            );
+        }
+        let document = serde_json::json!({
+            "tolerance_percent": COST_TOLERANCE_PERCENT,
+            "entrypoints": entrypoints,
+        });
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("cost-baseline.json");
+        std::fs::write(
+            path,
+            serde_json::to_string_pretty(&document).expect("serialize cost baseline") + "\n",
+        )
+        .expect("write cost baseline");
+        return;
+    }
+
+    let baseline: serde_json::Value =
+        serde_json::from_str(COST_BASELINE).expect("parse cost-baseline.json");
+    let tolerance = baseline["tolerance_percent"]
+        .as_i64()
+        .unwrap_or(COST_TOLERANCE_PERCENT);
+
+    for (name, cost) in &measured {
+        let entry = &baseline["entrypoints"][name];
+        for (metric, actual) in [
+            ("instructions", cost.instructions),
+            ("mem_bytes", cost.mem_bytes),
+            ("disk_read_bytes", cost.disk_read_bytes),
+            ("write_bytes", cost.write_bytes),
+        ] {
+            let recorded = entry[metric]
+                .as_i64()
+                .unwrap_or_else(|| panic!("cost-baseline.json has no {metric} for {name}"));
+            let limit = if recorded == 0 {
+                0
+            } else {
+                recorded + recorded * tolerance / 100
+            };
+            assert!(
+                actual <= limit,
+                "{name} {metric} regressed: baseline {recorded}, current {actual}, limit {limit} ({tolerance}% tolerance)"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scheme C: Consumer-chosen quorum attestation (#329)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn quorum_deduplicates_attestors_and_cannot_inflate_threshold() {
+    let (env, client, admin) = setup();
+    let asset = Address::generate(&env);
+
+    client.attest(&asset, &SEVERITY_CLEAR, &0, &hash(&env));
+
+    // Passing the same attestor (admin) multiple times must be deduplicated to 1.
+    // If threshold is 2, a duplicated single attestor cannot satisfy it.
+    let attestors = vec![&env, admin.clone(), admin.clone(), admin.clone()];
+    let res = client.quorum(&asset, &attestors, &2, &0);
+    assert_eq!(res, Quorum::Unavailable(0));
+
+    // Threshold 1 passes with the deduplicated single attestor
+    let res1 = client.quorum(&asset, &attestors, &1, &0);
+    assert_eq!(
+        res1,
+        Quorum::Met(Safety {
+            severity: SEVERITY_CLEAR,
+            flags: 0,
+            evidence_hash: hash(&env),
+            attested_at: env.ledger().timestamp(),
+            preimage_version: 4,
+        })
+    );
+}
+
+#[test]
+fn quorum_contested_and_unavailable_are_distinguishable_on_chain() {
+    let (env, client, admin) = setup();
+    let asset = Address::generate(&env);
+    let att2 = Address::generate(&env);
+    let att3 = Address::generate(&env);
+
+    // Write admin's attestation
+    client.attest(&asset, &SEVERITY_CLEAR, &0, &hash(&env));
+
+    // att2 writes a different severity via multi-attestor storage
+    env.as_contract(&client.address, || {
+        env.storage().persistent().set(
+            &DataKey::Attestation(att2.clone(), asset.clone()),
+            &Safety {
+                severity: SEVERITY_HIGH,
+                flags: MECH_CLAWBACK_ENABLED,
+                evidence_hash: hash(&env),
+                attested_at: env.ledger().timestamp(),
+                preimage_version: 4,
+            },
+        );
+    });
+
+    // 1 responding out of 3, threshold 2 -> Unavailable(1)
+    let attestors_unavailable = vec![&env, admin.clone(), att3.clone()];
+    let res_unavail = client.quorum(&asset, &attestors_unavailable, &2, &0);
+    assert_eq!(res_unavail, Quorum::Unavailable(1));
+
+    // 2 responding out of 2, threshold 2, but disagree -> Contested(2)
+    let attestors_contested = vec![&env, admin.clone(), att2.clone()];
+    let res_contested = client.quorum(&asset, &attestors_contested, &2, &0);
+    assert_eq!(res_contested, Quorum::Contested(2));
+
+    // Both are enum variants and distinguishable on chain
+    assert_ne!(res_unavail, res_contested);
+}
+
+#[test]
+fn quorum_conservative_aggregation_one_honest_attestor_prevents_admission() {
+    let (env, client, admin) = setup();
+    let asset = Address::generate(&env);
+    let malicious = Address::generate(&env);
+
+    // Honest attestor reports SEVERITY_HIGH and clawback
+    client.attest(&asset, &SEVERITY_HIGH, &MECH_CLAWBACK_ENABLED, &hash(&env));
+
+    // Malicious attestor claims SEVERITY_CLEAR and 0 flags
+    env.as_contract(&client.address, || {
+        env.storage().persistent().set(
+            &DataKey::Attestation(malicious.clone(), asset.clone()),
+            &Safety {
+                severity: SEVERITY_CLEAR,
+                flags: 0,
+                evidence_hash: hash(&env),
+                attested_at: env.ledger().timestamp(),
+                preimage_version: 4,
+            },
+        );
+    });
+
+    let attestors = vec![&env, admin.clone(), malicious.clone()];
+
+    // With conservative aggregation, maximum severity (HIGH) and union of flags are evaluated.
+    // A gate asking for max_severity <= MEDIUM will reject (false) because the honest attestor raised severity to HIGH.
+    assert!(!client.is_safe_quorum(&asset, &attestors, &2, &SEVERITY_MEDIUM, &0));
+
+    // Even if max_severity is HIGH, clawback is set in union of flags, so if max_severity were below HIGH it would reject.
+    // At HIGH, it is admitted:
+    assert!(client.is_safe_quorum(&asset, &attestors, &2, &SEVERITY_HIGH, &0));
+}
+
+/// Property test: conservative aggregation means one honest responding attestor reporting danger
+/// prevents admission across arbitrary combinations of responding attestor severities and thresholds.
+#[test]
+fn quorum_conservative_aggregation_property() {
+    let (env, client, admin) = setup();
+    let asset = Address::generate(&env);
+
+    // Honest attestor sets severity to HIGH (3)
+    client.attest(&asset, &SEVERITY_HIGH, &0, &hash(&env));
+
+    // Generate up to 5 other attestors with arbitrary severities (including 0, 1, 2)
+    let other_severities = [
+        SEVERITY_CLEAR,
+        SEVERITY_LOW,
+        SEVERITY_MEDIUM,
+        SEVERITY_CLEAR,
+        SEVERITY_LOW,
+    ];
+    let mut attestors = Vec::new(&env);
+    attestors.push_back(admin);
+
+    for (i, &sev) in other_severities.iter().enumerate() {
+        let att = Address::generate(&env);
+        env.as_contract(&client.address, || {
+            env.storage().persistent().set(
+                &DataKey::Attestation(att.clone(), asset.clone()),
+                &Safety {
+                    severity: sev,
+                    flags: 0,
+                    evidence_hash: hash(&env),
+                    attested_at: env.ledger().timestamp(),
+                    preimage_version: 4,
+                },
+            );
+        });
+        attestors.push_back(att);
+
+        // For any threshold from 1 to current set length:
+        // A gate requiring severity <= MEDIUM (2) MUST reject (return false)
+        // because the one honest attestor is in the set and its SEVERITY_HIGH (3) raises aggregate severity.
+        for thresh in 1..=attestors.len() {
+            assert!(
+                !client.is_safe_quorum(&asset, &attestors, &thresh, &SEVERITY_MEDIUM, &0),
+                "honest attestor reporting HIGH failed to prevent admission under threshold {thresh} at step {i}"
+            );
+        }
+    }
+}
+
+#[test]
+fn quorum_cost_at_the_bound() {
+    let (env, client, _admin) = setup();
+    let asset = Address::generate(&env);
+
+    let mut attestors = Vec::new(&env);
+    for _ in 0..MAX_ATTESTORS {
+        let att = Address::generate(&env);
+        env.as_contract(&client.address, || {
+            env.storage().persistent().set(
+                &DataKey::Attestation(att.clone(), asset.clone()),
+                &Safety {
+                    severity: SEVERITY_CLEAR,
+                    flags: 0,
+                    evidence_hash: hash(&env),
+                    attested_at: env.ledger().timestamp(),
+                    preimage_version: 4,
+                },
+            );
+        });
+        attestors.push_back(att);
+    }
+    assert_eq!(attestors.len(), MAX_ATTESTORS);
+
+    let res = client.quorum(&asset, &attestors, &MAX_ATTESTORS, &0);
+    assert_eq!(
+        res,
+        Quorum::Met(Safety {
+            severity: SEVERITY_CLEAR,
+            flags: 0,
+            evidence_hash: hash(&env),
+            attested_at: env.ledger().timestamp(),
+            preimage_version: 4,
+        })
+    );
+
+    let r = env.cost_estimate().resources();
+    let footprint = r.disk_read_entries + r.memory_read_entries + r.write_entries;
+
+    assert_eq!(r.contract_events_size_bytes, 0);
+    assert!(footprint <= 400, "footprint entries {footprint} exceed 400");
+    assert!(
+        r.instructions <= 400_000_000,
+        "instructions exceed 400 000 000"
+    );
+    assert!(r.mem_bytes <= 41_943_040, "memory exceeds 41 943 040");
 }

@@ -10,16 +10,23 @@ package mechanics
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/use-assay/assay/internal/assetlist"
+	"github.com/use-assay/assay/internal/clockskew"
 	"github.com/use-assay/assay/internal/horizon"
 	"github.com/use-assay/assay/internal/sep1"
 	"github.com/use-assay/assay/internal/stellarexpert"
 )
+
+// ErrPartialCheckSet reports that an engine has a subset of default checks
+// without the required AllowPartialCheckSet option (issue #404).
+var ErrPartialCheckSet = errors.New("mechanics: partial check set requires explicit AllowPartialCheckSet")
 
 // TimeFormat is the one wire format for every time value Assay emits (issue
 // #52): UTC, RFC 3339, whole-second precision (RFC 3339 "Z" form, no
@@ -139,6 +146,33 @@ type Evidence struct {
 	// and must be distinguishable by a program, not only by the wording of
 	// Claim.
 	Refused bool `json:"refused,omitempty"`
+	// LatestLedger is the ledger sequence Horizon reported when answering
+	// (issue #402). Observation time (RetrievedAt) is wall-clock; the ledger
+	// sequence is the ledger's own clock and lets a verifier ask "what did the
+	// ledger say at ledger N" from an archive node.
+	//
+	// It is metadata outside the evidence_hash preimage, matching RequestedURL:
+	// adding it does not change the digest of an otherwise unchanged report.
+	LatestLedger int64 `json:"latest_ledger,omitempty"`
+	// LedgerSequence is an alias for LatestLedger.
+	LedgerSequence int64 `json:"ledger_sequence,omitempty"`
+}
+
+// UnmarshalJSON decodes an Evidence object, ensuring LatestLedger and
+// LedgerSequence remain synchronized if either was emitted in JSON.
+func (e *Evidence) UnmarshalJSON(b []byte) error {
+	type wire Evidence
+	var w wire
+	if err := json.Unmarshal(b, &w); err != nil {
+		return fmt.Errorf("mechanics: unmarshal evidence: %w", err)
+	}
+	*e = Evidence(w)
+	if e.LatestLedger == 0 && e.LedgerSequence > 0 {
+		e.LatestLedger = e.LedgerSequence
+	} else if e.LedgerSequence == 0 && e.LatestLedger > 0 {
+		e.LedgerSequence = e.LatestLedger
+	}
+	return nil
 }
 
 // Finding is one check's result.
@@ -179,7 +213,12 @@ type Finding struct {
 	MechanicNames []string `json:"mechanics"`
 	// Accountability is set only by the check that establishes it.
 	Accountability *Accountability `json:"accountability,omitempty"`
-	Evidence       []Evidence      `json:"evidence"`
+	// AccountabilityReason classifies why the accountability verdict was
+	// reached, so consumers can distinguish "could not fetch" from "fetched
+	// but not claimed" from JSON alone. Absent when the check did not
+	// classify the verdict (for example a verified claim).
+	AccountabilityReason *AccountabilityReason `json:"accountability_reason,omitempty"`
+	Evidence             []Evidence            `json:"evidence"`
 }
 
 // Subject is the pre-fetched state a check reasons over. Checks must not reach
@@ -195,9 +234,13 @@ type Subject struct {
 	Stat  *horizon.AssetStat
 	// StatFetchedAt is when Horizon answered the /assets lookup.
 	StatFetchedAt time.Time
-	Issuer        *horizon.Account
+	// StatLedger is the ledger sequence Horizon reported for the /assets query.
+	StatLedger int64
+	Issuer     *horizon.Account
 	// IssuerFetchedAt is when Horizon answered the issuer /accounts lookup.
 	IssuerFetchedAt time.Time
+	// IssuerLedger is the ledger sequence Horizon reported for the /accounts query.
+	IssuerLedger int64
 
 	// Toml is the issuer's stellar.toml if it resolved. TomlErr records why it
 	// did not, and is reported verbatim rather than being smoothed over.
@@ -250,6 +293,23 @@ type Subject struct {
 	// that ran it and found nothing.
 	BlockedSkipped string
 
+	// ExpertAsset is StellarExpert's asset-level metadata (supply, trustline
+	// counters and the published rating) when it could be retrieved.
+	// ExpertAssetErr records why it could not, and ExpertAssetURL attributes
+	// either statement to the exact endpoint that made it. It is best-effort:
+	// an outage leaves ExpertAsset nil with a non-empty Err, the reputation
+	// check reports the gap as undetermined, and the scan itself still
+	// succeeds. The values are descriptive source data, never an Assay score,
+	// so they are evidence only and are not consulted by the severity rules.
+	//
+	// FetchedAt is when the endpoint answered; AttemptedAt is when it was
+	// asked, for failure evidence, which has no completion time to carry.
+	ExpertAsset            *stellarexpert.Asset
+	ExpertAssetURL         string
+	ExpertAssetErr         string
+	ExpertAssetFetchedAt   time.Time
+	ExpertAssetAttemptedAt time.Time
+
 	// AssetLists are the SEP-0042 curated lists consulted for this asset, one
 	// entry per configured list, in configuration order. Empty when no list is
 	// configured — which is the default, because shipping a default list would
@@ -280,6 +340,8 @@ type Subject struct {
 	// completion time — the source did answer, "not listed".
 	HolderFetchedAt   time.Time
 	HolderAttemptedAt time.Time
+	// HolderLedger is the ledger sequence Horizon reported for the holder trustline query.
+	HolderLedger int64
 
 	// ScannedAt is when the scan started. It is the report-level timestamp:
 	// evidence carries the time of the source it came from, and the report
@@ -376,6 +438,36 @@ func (s *Subject) DomainVerified() bool {
 	return s.Toml.Claims(s.Asset.Code, s.Asset.Issuer)
 }
 
+func (s *Subject) statLedger() int64 {
+	if s.StatLedger > 0 {
+		return s.StatLedger
+	}
+	if s.Stat != nil && s.Stat.LatestLedger > 0 {
+		return s.Stat.LatestLedger
+	}
+	return 0
+}
+
+func (s *Subject) issuerLedger() int64 {
+	if s.IssuerLedger > 0 {
+		return s.IssuerLedger
+	}
+	if s.Issuer != nil && s.Issuer.LatestLedger > 0 {
+		return s.Issuer.LatestLedger
+	}
+	return 0
+}
+
+func (s *Subject) holderLedger() int64 {
+	if s.HolderLedger > 0 {
+		return s.HolderLedger
+	}
+	if s.HolderTrustline != nil && s.HolderTrustline.LatestLedger > 0 {
+		return s.HolderTrustline.LatestLedger
+	}
+	return 0
+}
+
 // Check is a single mechanic classifier. Implementations are pure functions
 // over the Subject and must not perform I/O.
 type Check interface {
@@ -413,6 +505,10 @@ type Report struct {
 
 	// Accountability is reported alongside severity, never folded into it.
 	Accountability Accountability `json:"accountability"`
+	// AccountabilityReason classifies why the accountability verdict was
+	// reached. It is report metadata, not part of the hashed evidence
+	// preimage; see docs/contract-interface.md for the encoding decision.
+	AccountabilityReason *AccountabilityReason `json:"accountability_reason,omitempty"`
 
 	// State is the overall verdict state of the report:
 	//   - "valid": a fresh, complete verdict.
@@ -475,21 +571,28 @@ type Report struct {
 	// Checks is retained for the legacy evidence preimage encoding.
 	Checks []string `json:"-"`
 
-	// ScannerBound opts this report into the v3 preimage encoding, which
+	// PartialCheckSet reports that the engine ran with a check set smaller than
+	// the default under the explicit AllowPartialCheckSet option (issue #404).
+	// Such reports are refused by attest.FromReport.
+	PartialCheckSet bool `json:"partial_check_set,omitempty"`
+	// AllowPartialCheckSet records that the partial check set was explicitly allowed.
+	AllowPartialCheckSet bool `json:"allow_partial_check_set,omitempty"`
+
+	// ScannerBound opts this report into the v4 preimage encoding, which
 	// adds a `scanner` line naming the code that produced the report
-	// (issue #40). It is a deliberate opt-in flag rather than automatic so
-	// the encoding stays a property of the report: v1/v2 bytes are unchanged
-	// for every report that does not set it, which is what keeps the ten
-	// attestations already on chain reproducible. The identity itself is
+	// (issue #40). scan.Scanner sets it on every report it produces (#271);
+	// Engine.Run does not, so fixture-driven reports keep whatever encoding
+	// their other bindings select. The identity itself is
 	// attest.ScannerIdentity (the module version); the flag only decides
 	// whether the hashed bytes name it. Serialized so a report document can
 	// carry the fact that it was produced under identity binding.
 	ScannerBound bool `json:"scanner_bound,omitempty"`
 
-	Mechanics     Mechanic   `json:"-"`
-	MechanicNames []string   `json:"mechanics"`
-	Findings      []Finding  `json:"findings"`
-	Evidence      []Evidence `json:"evidence"`
+	Mechanics     Mechanic                `json:"-"`
+	MechanicNames []string                `json:"mechanics"`
+	Findings      []Finding               `json:"findings"`
+	Evidence      []Evidence              `json:"evidence"`
+	ClockSkews    []clockskew.Observation `json:"clock_skews,omitempty"`
 
 	// ObservationWindowStart is the start of the observation window for this report.
 	ObservationWindowStart time.Time `json:"observation_window_start,omitempty"`
@@ -508,19 +611,65 @@ type Report struct {
 	ScannedAt CanonicalTime `json:"scanned_at"`
 }
 
-// Engine runs a set of checks over a Subject.
-type Engine struct {
-	Checks []Check
+// Option configures an Engine.
+type Option func(*Engine)
+
+// AllowPartialCheckSet explicitly permits an engine to run with a check set
+// smaller than the default or a subset of default checks (issue #404). Reports
+// produced by such an engine will have PartialCheckSet set to true and will be
+// refused by attest.FromReport.
+func AllowPartialCheckSet() Option {
+	return func(e *Engine) {
+		e.AllowPartialCheckSet = true
+	}
 }
 
-// NewEngine returns an Engine with the default check set.
-func NewEngine() *Engine {
-	return &Engine{Checks: []Check{
+// WithChecks configures an Engine with specific checks.
+func WithChecks(checks ...Check) Option {
+	return func(e *Engine) {
+		e.Checks = checks
+	}
+}
+
+// Engine runs a set of checks over a Subject.
+type Engine struct {
+	Checks               []Check
+	AllowPartialCheckSet bool
+}
+
+// defaultCheckIDs lists the stable IDs of the full default check set.
+var defaultCheckIDs = []string{"capability", "mutability", "reputation", "sep1-domain"}
+
+// IsPartialCheckSet reports whether the engine runs a check set smaller than
+// the default or a subset of the default checks (issue #404).
+func (e *Engine) IsPartialCheckSet() bool {
+	if len(e.Checks) < len(defaultCheckIDs) {
+		return true
+	}
+	have := make(map[string]bool, len(e.Checks))
+	for _, c := range e.Checks {
+		have[c.ID()] = true
+	}
+	for _, id := range defaultCheckIDs {
+		if !have[id] {
+			return true
+		}
+	}
+	return false
+}
+
+// NewEngine returns an Engine. With no options, it uses the default check set.
+func NewEngine(opts ...Option) *Engine {
+	e := &Engine{Checks: []Check{
 		CapabilityCheck{},
 		MutabilityCheck{},
 		DomainCheck{},
 		ReputationCheck{},
 	}}
+	for _, opt := range opts {
+		opt(e)
+	}
+	return e
 }
 
 // CheckIDs returns the stable IDs of the checks this engine runs, sorted so
@@ -578,6 +727,14 @@ func (e *Engine) Run(ctx context.Context, s *Subject) (*Report, error) {
 		UndeterminedBySource: make(map[string]int),
 	}
 
+	if e.IsPartialCheckSet() {
+		if !e.AllowPartialCheckSet {
+			return nil, fmt.Errorf("%w: engine check set is smaller than default without explicit AllowPartialCheckSet", ErrPartialCheckSet)
+		}
+		rep.PartialCheckSet = true
+		rep.AllowPartialCheckSet = true
+	}
+
 	totalChecks := len(e.Checks)
 	undeterminedCount := 0
 
@@ -612,6 +769,9 @@ func (e *Engine) Run(ctx context.Context, s *Subject) (*Report, error) {
 
 		if f.Accountability != nil {
 			rep.Accountability = *f.Accountability
+		}
+		if f.AccountabilityReason != nil {
+			rep.AccountabilityReason = f.AccountabilityReason
 		}
 		// The escalation invariant, enforced here rather than left as
 		// convention: a finding marked Escalation may raise the level and set

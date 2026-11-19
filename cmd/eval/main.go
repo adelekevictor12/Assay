@@ -15,7 +15,9 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
+	"time"
 
 	"github.com/use-assay/assay/internal/eval"
 	"github.com/use-assay/assay/internal/mechanics"
@@ -37,7 +39,7 @@ func run(args []string) error {
 	confusion := fs.Bool("confusion", false, "print the confusion matrix over the labelled corpus")
 	precisionRecall := fs.Bool("precision-recall", false, "with -confusion, emit precision and recall with a sample-size caveat")
 	if err := fs.Parse(args); err != nil {
-		return err
+		return fmt.Errorf("eval: %w", err)
 	}
 	if *out == "" && *compare == "" && !*confusion {
 		return fmt.Errorf("nothing to do: pass -out to record a run, -compare to diff one, or -confusion to print the matrix")
@@ -45,6 +47,13 @@ func run(args []string) error {
 
 	rec, err := eval.Run(mechanics.NewEngine(), *fixtures)
 	if err != nil {
+		return fmt.Errorf("eval: %w", err)
+	}
+	captureDates, err := eval.CaptureDates(*fixtures)
+	if err != nil {
+		return fmt.Errorf("eval: %w", err)
+	}
+	if err := printFixtureAges(os.Stdout, rec, captureDates, time.Now().UTC()); err != nil {
 		return err
 	}
 
@@ -70,7 +79,7 @@ func run(args []string) error {
 	if *confusion {
 		matrix, err := eval.BuildConfusionMatrix(mechanics.NewEngine(), *fixtures)
 		if err != nil {
-			return err
+			return fmt.Errorf("confusion matrix: %w", err)
 		}
 		matrix.Print(*precisionRecall)
 	}
@@ -78,19 +87,52 @@ func run(args []string) error {
 	return nil
 }
 
+const staleFixtureAgeDays = 90
+
+func printFixtureAges(w io.Writer, rec *eval.Record, captureDates map[string]time.Time, now time.Time) error {
+	today := time.Date(now.UTC().Year(), now.UTC().Month(), now.UTC().Day(), 0, 0, 0, 0, time.UTC)
+	for _, subject := range rec.Subjects {
+		captured, ok := captureDates[subject.Dir]
+		if !ok {
+			return fmt.Errorf("eval: fixture manifest has no capture date for subject %s", subject.Dir)
+		}
+		ageDays := int(today.Sub(captured).Hours() / 24)
+		ageUnit := "days"
+		if ageDays == 1 || ageDays == -1 {
+			ageUnit = "day"
+		}
+		if _, err := fmt.Fprintf(w, "fixture age: %s captured %s (%d %s old)",
+			subject.Dir, captured.Format("2006-01-02"), ageDays, ageUnit); err != nil {
+			return fmt.Errorf("eval: write fixture age: %w", err)
+		}
+		if ageDays > staleFixtureAgeDays {
+			if _, err := fmt.Fprintf(w, " - STALE: older than %d days", staleFixtureAgeDays); err != nil {
+				return fmt.Errorf("eval: write fixture age: %w", err)
+			}
+		}
+		if _, err := fmt.Fprintln(w); err != nil {
+			return fmt.Errorf("eval: write fixture age: %w", err)
+		}
+	}
+	return nil
+}
+
 func writeRecord(path string, rec *eval.Record) error {
 	b, err := json.MarshalIndent(rec, "", "  ")
 	if err != nil {
-		return err
+		return fmt.Errorf("encode record: %w", err)
 	}
 	b = append(b, '\n')
-	return os.WriteFile(path, b, 0o644)
+	if err := os.WriteFile(path, b, 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	return nil
 }
 
 func readRecord(path string) (*eval.Record, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
 	var rec eval.Record
 	if err := json.Unmarshal(b, &rec); err != nil {

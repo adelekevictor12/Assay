@@ -15,8 +15,9 @@ Related work:
 
 - Admin rotation in the contract: [#89](https://github.com/use-assay/Assay/issues/89).
   The registry **source** now implements `transfer_admin`/`accept_admin`, a
-  two-step handshake; the **live testnet instance** predates them and cannot be
-  upgraded, so on it redeploy is still the only rotation. See
+  two-step handshake with `cancel_admin_transfer` to withdraw a proposal; the
+  **live testnet instance** predates them and cannot be upgraded, so on it
+  redeploy is still the only rotation. See
   [Rotation](#rotation).
 - Threat model: [#30](https://github.com/use-assay/Assay/issues/30).
   `docs/threat-model.md` does not exist yet. The attacker-capability
@@ -80,6 +81,26 @@ Recommended but **not yet done** (do not read these as claims):
    consumer-chosen quorum recommended in
    [multi-attestor.md](multi-attestor.md#recommendation) — before widening
    attested-asset coverage.
+
+## Secret scanning in CI
+
+CI scans every added line in a pull request or push for a Stellar secret seed:
+an `S` followed by 55 base32 characters. It then validates the strkey version
+byte and CRC-16 checksum, so an arbitrary `S…` string does not fail the build
+and a public `G…` account address cannot match in the first place. The logic is
+in `scripts/secretscan` and the diff wrapper is
+`scripts/check-secret-seeds.sh`; run it against any range with:
+
+```sh
+./scripts/check-secret-seeds.sh main HEAD
+```
+
+A genuine false positive — for example a published test vector that really is
+a valid seed — is escaped by putting `secret-scan: allow-seed` on that line.
+The marker skips only the line it appears on, and it should be justified in the
+pull request. Never use it for a live key: a valid seed committed with the
+marker is still a leaked key, and the marker only tells the scanner not to
+block the commit.
 
 ## Semantics
 
@@ -175,8 +196,8 @@ archival is not expiry and not a recovery,
    still pointed at the old ID keeps reading its (stale) attestations.
 
 There is no faster path even on a registry built from current source, where
-`transfer_admin`/`accept_admin` do exist: the first step needs the current
-admin's signature, and a lost key cannot sign it. `init` is single-shot
+`transfer_admin`/`accept_admin` (and `cancel_admin_transfer`) do exist: the
+first step needs the current admin's signature, and a lost key cannot sign it. `init` is single-shot
 (`AlreadyInitialized` on a second call) as well, so the existing contract
 cannot be re-initialized onto a new key either. See [Rotation](#rotation).
 
@@ -204,7 +225,8 @@ says otherwise.
    very key you have declared compromised, so the attacker can submit it too,
    or overwrite your pending admin with their own before it is accepted. A
    handshake rotation is for a *planned* key change with a healthy admin, not
-   for a compromise. The compromised admin has no power over the new registry.
+   for a compromise (see [threat-model.md attack class 14](threat-model.md#14-permanent-takeover-via-the-pending-admin-window-transfer_admin)).
+   The compromised admin has no power over the new registry.
 4. **Leave the old registry in place and mark it superseded** in
    [deployment.md](deployment.md). It cannot be deleted or frozen from the
    outside; the protection for its remaining readers is the same
@@ -233,7 +255,8 @@ not the same contract, and this section keeps them apart.
 - **The registry source**
   ([`assay-contracts/contracts/safety-registry`](../assay-contracts/contracts/safety-registry))
   now implements a **two-step admin transfer** through `transfer_admin` and
-  `accept_admin`. Any instance deployed from current source — the next
+  `accept_admin`, plus `cancel_admin_transfer` to withdraw a pending proposal.
+  Any instance deployed from current source — the next
   deployment, or a fresh one — supports rotation in place, with no redeploy and
   no re-attestation.
 
@@ -261,9 +284,20 @@ cannot take the registry:
    that point the old key can no longer `attest`, `revoke`, or start a
    transfer.
 
-`accept_admin` with no pending transfer returns `NoPendingAdmin` (error 6)
-rather than succeeding quietly. The full ABI, auth requirements and error table
-are in
+If the proposal was aimed at the wrong or a compromised address, the current
+admin can withdraw it before it is accepted:
+
+```sh
+stellar contract invoke --id <CONTRACT_ID> \
+  --source-account assay-attester --network testnet \
+  -- cancel_admin_transfer
+```
+
+This clears the pending entry, leaves the current admin in place, and emits an
+event. A later `accept_admin` by the withdrawn address fails with
+`NoPendingAdmin` (error 6). `cancel_admin_transfer` with nothing pending also
+returns `NoPendingAdmin` (error 6) rather than succeeding quietly. The full ABI,
+auth requirements and error table are in
 [contract-interface.md](contract-interface.md#admin-transfer-two-step-rotation).
 
 Attestations are **not** affected by a transfer: they are stored by asset, not
@@ -277,6 +311,60 @@ not the compromise response** — the proposal is authorized by the very key a
 compromise has put in an attacker's hands — and it is not loss recovery either,
 because a lost key cannot sign the first step. Both of those remain
 redeploy-and-re-attest, as the sections above state.
+
+## Signing ceremony for a multisig admin
+
+This is the procedure for [Scheme A](multi-attestor.md#scheme-a-the-admin-becomes-a-threshold-account)
+([#327](https://github.com/use-assay/Assay/issues/327)): the admin becomes a
+native 2-of-3 Stellar account, so no single key can write. It needs no
+contract change. **Status: documented, not yet executed.** The testnet admin
+is still the single key above; creating the signers' keys, rotating the admin
+and writing the first multisig attestation need three people holding keys on
+separate machines, and nothing in this repository can do that for them.
+
+**Setup.** Each of three signers generates their own key on their own machine
+and shares only the public `G...` address. Nobody ever transmits a seed.
+`scripts/multisig-admin-plan.sh MULTISIG SIGNER1 SIGNER2 SIGNER3` takes the
+four public keys and prints the `set-options` commands (three weight-1
+signers, all thresholds 2, master weight 0), the verification query, and the
+admin hand-off. It refuses seeds, malformed keys and duplicates, and submits
+nothing.
+
+**Rotating the admin.** On a registry built from current source, use the
+[two-step transfer](#two-step-transfer-on-a-source-built-instance):
+`transfer_admin` to the multisig account, then `accept_admin` signed by two
+signers. The live testnet instance has no rotation entrypoint, so there the
+multisig is installed through the migration to a new registry
+([deployment.md](deployment.md#migrating-to-a-registry-with-revoke)) with the
+multisig account as `init`'s admin. Do not retire the old key until the
+account's signers and thresholds have been read back from Horizon.
+
+**Signing ceremony, per attestation.** The scheme cannot check that signers
+look; the ceremony is what makes them look.
+
+1. The coordinator runs `make attest`'s derivation (`assay attestation -raw
+   ASSET`) and builds **one** unsigned transaction, then shares the
+   transaction envelope and the derived severity, flags and evidence hash.
+2. **Each signer independently re-scans** the asset on their own machine with
+   `assay attestation -raw ASSET` and compares severity, flags and evidence
+   hash with the transaction's arguments. A mismatch, or an undetermined scan,
+   means **do not sign**; say why.
+3. A signer who agrees signs the envelope on their own machine and returns
+   only the signature.
+4. When two signatures are collected, the coordinator submits. The registry
+   sees a normal `require_auth` success.
+5. Record the transaction hash and the signers' public keys in the run record
+   and in [deployment.md](deployment.md).
+
+A coordinator that is compromised can propose a bad value; step 2 is the
+defence, so a signer who skips it has turned 2-of-3 back into one key. A
+signer who disagrees simply does not sign, which the registry cannot tell from
+an offline signer.
+
+**Acceptance status for #327.** Not done, needs the keys: the account is
+2-of-3, and one attestation is written through it with its transaction
+recorded. Done in the repository: this procedure and the public-key-only
+planning script.
 
 ## What this document does not publish
 

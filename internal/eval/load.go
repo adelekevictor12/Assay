@@ -63,8 +63,10 @@ func LoadSubject(fixturesDir, dir string) (*mechanics.Subject, error) {
 		Asset:           mechanics.Asset{Code: stat.AssetCode, Issuer: stat.AssetIssuer},
 		Stat:            &stat,
 		StatFetchedAt:   fixtureTime,
+		StatLedger:      stat.LatestLedger,
 		Issuer:          &acct,
 		IssuerFetchedAt: fixtureTime,
+		IssuerLedger:    acct.LatestLedger,
 		ScannedAt:       fixtureTime,
 	}
 
@@ -116,6 +118,25 @@ func LoadSubject(fixturesDir, dir string) (*mechanics.Subject, error) {
 	} else if msg, ok := readErrMarker(filepath.Join(base, "blocked.err")); ok {
 		s.BlockedErr = msg
 	}
+
+	// StellarExpert's asset metadata follows the same three-state format as
+	// the other reputation sources: a payload file means the endpoint
+	// answered, an error marker means the fetch was consulted and failed, and
+	// neither means the source was not consulted. The URL and the attempt time
+	// are always recorded, mirroring the live scanner, which always knows
+	// where it would have asked.
+	s.ExpertAssetURL = "https://api.stellar.expert/explorer/public/asset/" + stat.AssetCode + "-" + stat.AssetIssuer
+	s.ExpertAssetAttemptedAt = fixtureTime
+	if _, err := os.Stat(filepath.Join(base, "stellar-expert-asset.json")); err == nil {
+		var a stellarexpert.Asset
+		if err := readJSON(filepath.Join(base, "stellar-expert-asset.json"), &a); err != nil {
+			return nil, err
+		}
+		s.ExpertAsset = &a
+		s.ExpertAssetFetchedAt = fixtureTime
+	} else if msg, ok := readErrMarker(filepath.Join(base, "stellar-expert-asset.err")); ok {
+		s.ExpertAssetErr = msg
+	}
 	return s, nil
 }
 
@@ -139,7 +160,7 @@ func readErrMarker(path string) (string, bool) {
 func readJSON(path string, out any) error {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return err
+		return fmt.Errorf("read %s: %w", path, err)
 	}
 	if err := json.Unmarshal(b, out); err != nil {
 		return fmt.Errorf("decode %s: %w", path, err)

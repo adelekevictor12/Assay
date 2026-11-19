@@ -10,9 +10,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 	"time"
+
+	"github.com/use-assay/assay/internal/clockskew"
 )
 
 // DefaultURL is the public Horizon instance for pubnet.
@@ -110,6 +115,62 @@ type Flags struct {
 	AuthClawbackEnabled bool `json:"auth_clawback_enabled"`
 }
 
+// UnmarshalJSON decodes a Horizon flags object, refusing a partial one.
+//
+// Horizon always publishes all four authorization flags. Decoded into plain
+// bools, a flag the response omitted would be indistinguishable from a false
+// one — and a silently-false auth_clawback_enabled or auth_revocable turns a
+// malformed response into a wrong capability reading, which is precisely the
+// failure the severity model cannot survive. So a flags object missing any of
+// the four keys, or carrying anything but a boolean, is a decode error: a
+// complete flag set or an error, never a half-populated one.
+func (f *Flags) UnmarshalJSON(b []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return fmt.Errorf("horizon: flags: %w", err)
+	}
+	var out Flags
+	for _, field := range []struct {
+		key string
+		dst *bool
+	}{
+		{"auth_required", &out.AuthRequired},
+		{"auth_revocable", &out.AuthRevocable},
+		{"auth_immutable", &out.AuthImmutable},
+		{"auth_clawback_enabled", &out.AuthClawbackEnabled},
+	} {
+		v, ok := raw[field.key]
+		if !ok {
+			return fmt.Errorf("horizon: flags object carries no %s", field.key)
+		}
+		if err := json.Unmarshal(v, field.dst); err != nil {
+			return fmt.Errorf("horizon: flags %s: %w", field.key, err)
+		}
+	}
+	*f = out
+	return nil
+}
+
+// requireFlagsObject refuses a record whose flags key is absent.
+//
+// encoding/json skips a field whose key is missing, so a record with no
+// `flags` at all would decode to an all-false flag set without ever invoking
+// Flags.UnmarshalJSON — the same silent false a partial flags object would
+// produce, from the other direction. Presence is checked here; completeness
+// inside the object is Flags.UnmarshalJSON's job.
+func requireFlagsObject(b []byte) error {
+	var probe struct {
+		Flags json.RawMessage `json:"flags"`
+	}
+	if err := json.Unmarshal(b, &probe); err != nil {
+		return fmt.Errorf("horizon: decode record: %w", err)
+	}
+	if probe.Flags == nil {
+		return errors.New("horizon: record carries no flags object")
+	}
+	return nil
+}
+
 // AssetStat is the subset of Horizon's /assets record that Assay reasons about.
 type AssetStat struct {
 	AssetType   string `json:"asset_type"`
@@ -126,13 +187,47 @@ type AssetStat struct {
 			Href string `json:"href"`
 		} `json:"toml"`
 	} `json:"_links"`
+	LatestLedger int64 `json:"latest_ledger,omitempty"`
+}
+
+// UnmarshalJSON decodes an asset record, requiring its flags object; see
+// requireFlagsObject for why an absent key must be an error rather than an
+// all-false flag set.
+func (s *AssetStat) UnmarshalJSON(b []byte) error {
+	type wire AssetStat
+	var w wire
+	if err := json.Unmarshal(b, &w); err != nil {
+		return fmt.Errorf("horizon: decode asset: %w", err)
+	}
+	if err := requireFlagsObject(b); err != nil {
+		return err
+	}
+	*s = AssetStat(w)
+	return nil
 }
 
 // Account is the subset of Horizon's /accounts record that Assay reasons about.
 type Account struct {
-	AccountID  string `json:"account_id"`
-	HomeDomain string `json:"home_domain"`
-	Flags      Flags  `json:"flags"`
+	AccountID    string `json:"account_id"`
+	HomeDomain   string `json:"home_domain"`
+	Flags        Flags  `json:"flags"`
+	LatestLedger int64  `json:"latest_ledger,omitempty"`
+}
+
+// UnmarshalJSON decodes an account record, requiring its flags object; see
+// requireFlagsObject for why an absent key must be an error rather than an
+// all-false flag set.
+func (a *Account) UnmarshalJSON(b []byte) error {
+	type wire Account
+	var w wire
+	if err := json.Unmarshal(b, &w); err != nil {
+		return fmt.Errorf("horizon: decode account: %w", err)
+	}
+	if err := requireFlagsObject(b); err != nil {
+		return err
+	}
+	*a = Account(w)
+	return nil
 }
 
 // TrustlineBalance is a single credit-trustline entry from the balances array
@@ -153,7 +248,8 @@ type TrustlineBalance struct {
 	// trustline is created: a holder who opened before the issuer set
 	// auth_clawback_enabled is not exposed even if the issuer's account flag
 	// is currently set. SetTrustLineFlagsOp cannot add it retroactively.
-	IsClawbackEnabled bool `json:"is_clawback_enabled"`
+	IsClawbackEnabled bool  `json:"is_clawback_enabled"`
+	LatestLedger      int64 `json:"latest_ledger,omitempty"`
 }
 
 // Client reads from a Horizon instance.
@@ -190,7 +286,8 @@ func (c *Client) Asset(ctx context.Context, code, issuer string) (*AssetStat, er
 			Records []AssetStat `json:"records"`
 		} `json:"_embedded"`
 	}
-	if err := c.get(ctx, "/assets?"+q.Encode(), &page); err != nil {
+	ledgerSeq, err := c.getWithLedger(ctx, "/assets?"+q.Encode(), &page)
+	if err != nil {
 		return nil, err
 	}
 	if len(page.Embedded.Records) == 0 {
@@ -209,6 +306,7 @@ func (c *Client) Asset(ctx context.Context, code, issuer string) (*AssetStat, er
 			code, issuer, rec.AssetCode, rec.AssetIssuer,
 		)
 	}
+	rec.LatestLedger = ledgerSeq
 	return &rec, nil
 }
 
@@ -219,7 +317,8 @@ func (c *Client) Asset(ctx context.Context, code, issuer string) (*AssetStat, er
 // flag Assay reads on that account is built into the scan.
 func (c *Client) Account(ctx context.Context, id string) (*Account, error) {
 	var a Account
-	if err := c.get(ctx, "/accounts/"+url.PathEscape(id), &a); err != nil {
+	ledgerSeq, err := c.getWithLedger(ctx, "/accounts/"+url.PathEscape(id), &a)
+	if err != nil {
 		return nil, err
 	}
 	if a.AccountID != id {
@@ -227,6 +326,7 @@ func (c *Client) Account(ctx context.Context, id string) (*Account, error) {
 			"horizon: account %s echoed %s", id, a.AccountID,
 		)
 	}
+	a.LatestLedger = ledgerSeq
 	return &a, nil
 }
 
@@ -236,11 +336,13 @@ func (c *Client) Trustline(ctx context.Context, holder, code, issuer string) (*T
 	var a struct {
 		Balances []TrustlineBalance `json:"balances"`
 	}
-	if err := c.get(ctx, "/accounts/"+url.PathEscape(holder), &a); err != nil {
+	ledgerSeq, err := c.getWithLedger(ctx, "/accounts/"+url.PathEscape(holder), &a)
+	if err != nil {
 		return nil, err
 	}
 	for i, b := range a.Balances {
 		if b.AssetCode == code && b.AssetIssuer == issuer {
+			a.Balances[i].LatestLedger = ledgerSeq
 			return &a.Balances[i], nil
 		}
 	}
@@ -260,7 +362,8 @@ func (c *Client) Trustlines(ctx context.Context, holder string) ([]TrustlineBala
 	var a struct {
 		Balances []TrustlineBalance `json:"balances"`
 	}
-	if err := c.get(ctx, "/accounts/"+url.PathEscape(holder), &a); err != nil {
+	ledgerSeq, err := c.getWithLedger(ctx, "/accounts/"+url.PathEscape(holder), &a)
+	if err != nil {
 		return nil, err
 	}
 	tls := make([]TrustlineBalance, 0, len(a.Balances))
@@ -268,33 +371,102 @@ func (c *Client) Trustlines(ctx context.Context, holder string) ([]TrustlineBala
 		if b.AssetCode == "" || b.AssetIssuer == "" {
 			continue
 		}
+		b.LatestLedger = ledgerSeq
 		tls = append(tls, b)
 	}
 	return tls, nil
 }
 
-func (c *Client) get(ctx context.Context, path string, out any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+path, nil)
+// parseLatestLedger extracts the latest ledger sequence from HTTP response headers.
+func parseLatestLedger(h http.Header) int64 {
+	for _, key := range []string{"Latest-Ledger", "X-Current-Ledger", "X-Ledger-Sequence"} {
+		if val := h.Get(key); val != "" {
+			if seq, err := strconv.ParseInt(strings.TrimSpace(val), 10, 64); err == nil && seq > 0 {
+				return seq
+			}
+		}
+	}
+	return 0
+}
+
+// LatestLedger returns the latest ledger sequence from Horizon's root endpoint (GET /).
+func (c *Client) LatestLedger(ctx context.Context) (int64, error) {
+	var root struct {
+		HistoryLatestLedger int64 `json:"history_latest_ledger"`
+		CoreLatestLedger    int64 `json:"core_latest_ledger"`
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+"/", nil)
 	if err != nil {
-		return err
+		return 0, fmt.Errorf("horizon: build root request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", c.UserAgent)
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return fmt.Errorf("horizon: get %s: %w", path, err)
+		return 0, fmt.Errorf("horizon: get /: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("horizon: get /: status %d", resp.StatusCode)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&root); err != nil {
+		return 0, fmt.Errorf("horizon: decode /: %w", err)
+	}
+	if root.HistoryLatestLedger > 0 {
+		return root.HistoryLatestLedger, nil
+	}
+	return root.CoreLatestLedger, nil
+}
+
+func (c *Client) getWithLedger(ctx context.Context, path string, out any) (int64, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+path, nil)
+	if err != nil {
+		return 0, fmt.Errorf("horizon: build request %s: %w", path, err)
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", c.UserAgent)
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("horizon: get %s: %w", path, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	clockskew.Record(req.Context(), "horizon", resp.Request.URL.String(),
+		resp.Header.Get("Date"), time.Now().UTC())
 
 	if resp.StatusCode == http.StatusNotFound {
-		return fmt.Errorf("%w: %s", ErrNotFound, path)
+		return 0, fmt.Errorf("%w: %s", ErrNotFound, path)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("horizon: get %s: status %d", path, resp.StatusCode)
+		return 0, fmt.Errorf("horizon: get %s: status %d", path, resp.StatusCode)
 	}
-	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
-		return fmt.Errorf("horizon: decode %s: %w", path, err)
+
+	ledgerSeq := parseLatestLedger(resp.Header)
+	if ledgerSeq == 0 && path != "/" && path != "" {
+		if rootSeq, err := c.LatestLedger(ctx); err == nil && rootSeq > 0 {
+			ledgerSeq = rootSeq
+		}
 	}
-	return nil
+
+	dec := json.NewDecoder(resp.Body)
+	if err := dec.Decode(out); err != nil {
+		return 0, fmt.Errorf("horizon: decode %s: %w", path, err)
+	}
+	// Decode accepts a valid first value and silently ignores anything after
+	// it. A response is either one JSON document or a decode error, never a
+	// record extracted from a larger or malformed payload.
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("unexpected data after top-level value")
+		}
+		return 0, fmt.Errorf("horizon: decode %s: trailing data: %w", path, err)
+	}
+	return ledgerSeq, nil
+}
+
+func (c *Client) get(ctx context.Context, path string, out any) error {
+	_, err := c.getWithLedger(ctx, path, out)
+	return err
 }
